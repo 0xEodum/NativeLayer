@@ -2,14 +2,7 @@ package com.yumsg.core.network;
 
 import android.content.Context;
 import android.net.ConnectivityManager;
-import android.net.Network;
-import android.net.NetworkCapabilities;
-import android.net.NetworkRequest;
 import android.net.wifi.WifiManager;
-import android.net.wifi.p2p.WifiP2pConfig;
-import android.net.wifi.p2p.WifiP2pDevice;
-import android.net.wifi.p2p.WifiP2pDeviceList;
-import android.net.wifi.p2p.WifiP2pInfo;
 import android.net.wifi.p2p.WifiP2pManager;
 import android.util.Log;
 
@@ -17,34 +10,22 @@ import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.reflect.TypeToken;
 
-import com.yumsg.core.data.*;
-import com.yumsg.core.enums.*;
-import com.yumsg.core.state.StateManager;
-import com.yumsg.core.storage.SharedPreferencesManager;
-
 import java.io.*;
-import java.lang.reflect.Type;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
- * LocalNetworkManager - Complete P2P Implementation
+ * LocalNetworkManager - P2P Implementation with Algorithm Exchange
  * 
- * Manages peer-to-peer communication for local network mode.
- * Implements device discovery, direct messaging, and file transfer without server infrastructure.
- * 
- * Key Features:
- * - Multicast device discovery
- * - Wi-Fi Direct peer connections
- * - Direct socket communication
- * - P2P file transfer
- * - Network state monitoring
- * - Offline-first architecture
- * - Local user management
+ * Implements peer-to-peer communication for local network mode.
+ * Key difference from ServerNetworkManager: MUST transmit crypto algorithms
+ * during chat initialization as there's no central authority.
  */
 public class LocalNetworkManager implements NetworkManager {
     private static final String TAG = "LocalNetworkManager";
@@ -57,21 +38,26 @@ public class LocalNetworkManager implements NetworkManager {
     private static final int DISCOVERY_INTERVAL_MS = 5000;
     private static final int PEER_TIMEOUT_MS = 30000;
     private static final int CONNECTION_TIMEOUT_MS = 10000;
+    private static final int SOCKET_TIMEOUT_MS = 30000;
     
     // Protocol messages
     private static final String MSG_DISCOVERY_REQUEST = "YUMSG_DISCOVERY_REQUEST";
     private static final String MSG_DISCOVERY_RESPONSE = "YUMSG_DISCOVERY_RESPONSE";
     private static final String MSG_USER_MESSAGE = "YUMSG_USER_MESSAGE";
-    private static final String MSG_CHAT_INIT = "YUMSG_CHAT_INIT";
+    private static final String MSG_CHAT_INIT_REQUEST = "YUMSG_CHAT_INIT_REQUEST";
+    private static final String MSG_CHAT_INIT_RESPONSE = "YUMSG_CHAT_INIT_RESPONSE";
+    private static final String MSG_CHAT_INIT_CONFIRM = "YUMSG_CHAT_INIT_CONFIRM";
+    private static final String MSG_CHAT_INIT_SIGNATURE = "YUMSG_CHAT_INIT_SIGNATURE";
+    private static final String MSG_CHAT_DELETE = "YUMSG_CHAT_DELETE";
     private static final String MSG_FILE_TRANSFER = "YUMSG_FILE_TRANSFER";
     private static final String MSG_STATUS_UPDATE = "YUMSG_STATUS_UPDATE";
     
     // Thread safety
-    private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
+    private final ReadWriteLock lock = new ReentrantReadWriteLock();
     private final AtomicBoolean isInitialized = new AtomicBoolean(false);
     private final AtomicBoolean isDiscovering = new AtomicBoolean(false);
     
-    // Dependencies
+    // Core components
     private final Context context;
     private final Gson gson;
     private final ExecutorService executorService;
@@ -91,7 +77,7 @@ public class LocalNetworkManager implements NetworkManager {
     // State management
     private volatile ConnectionState connectionState = ConnectionState.DISCONNECTED;
     private volatile ConnectionMetrics connectionMetrics;
-    private volatile String localUsername;
+    private volatile String localPeerId;
     private volatile UserProfile localUserProfile;
     
     // Peer management
@@ -99,8 +85,11 @@ public class LocalNetworkManager implements NetworkManager {
     private final Map<String, PeerConnection> activePeerConnections = new ConcurrentHashMap<>();
     private final Set<P2PMessageListener> messageListeners = ConcurrentHashMap.newKeySet();
     
-    // Message queuing for offline scenarios
+    // Message queuing
     private final Queue<QueuedMessage> messageQueue = new ConcurrentLinkedQueue<>();
+    
+    // Discovery broadcast task
+    private ScheduledFuture<?> discoveryBroadcastTask;
     
     /**
      * Constructor
@@ -114,8 +103,9 @@ public class LocalNetworkManager implements NetworkManager {
         this.executorService = Executors.newCachedThreadPool();
         this.scheduler = Executors.newScheduledThreadPool(3);
         this.connectionMetrics = new ConnectionMetrics();
+        this.localPeerId = generatePeerId();
         
-        Log.d(TAG, "LocalNetworkManager instance created");
+        Log.d(TAG, "LocalNetworkManager instance created with peer ID: " + localPeerId);
     }
     
     // ===========================
@@ -128,6 +118,11 @@ public class LocalNetworkManager implements NetworkManager {
             lock.writeLock().lock();
             try {
                 Log.d(TAG, "Connecting to local P2P network");
+                
+                // Extract local user info if provided
+                if (connectionParams != null && connectionParams.containsKey("userProfile")) {
+                    this.localUserProfile = (UserProfile) connectionParams.get("userProfile");
+                }
                 
                 // Initialize network components
                 if (!initializeNetworkComponents()) {
@@ -145,14 +140,15 @@ public class LocalNetworkManager implements NetworkManager {
                 }
                 
                 // Update connection state
-                setConnectionState(ConnectionState.CONNECTED);
+                connectionState = ConnectionState.CONNECTED;
+                connectionMetrics.recordConnectionAttempt(true);
                 
                 Log.i(TAG, "Connected to local P2P network successfully");
                 return new ConnectionResult(true, "Connected to local P2P network");
                 
             } catch (Exception e) {
                 Log.e(TAG, "P2P connection failed", e);
-                setConnectionState(ConnectionState.ERROR);
+                connectionMetrics.recordConnectionAttempt(false);
                 return new ConnectionResult(false, "P2P connection failed: " + e.getMessage());
             } finally {
                 lock.writeLock().unlock();
@@ -161,38 +157,35 @@ public class LocalNetworkManager implements NetworkManager {
     }
     
     @Override
-    public CompletableFuture<Void> disconnect() {
-        return CompletableFuture.runAsync(() -> {
-            lock.writeLock().lock();
-            try {
-                Log.d(TAG, "Disconnecting from P2P network");
-                
-                // Stop discovery
-                stopDiscovery();
-                
-                // Close all peer connections
-                for (PeerConnection connection : activePeerConnections.values()) {
-                    connection.close();
-                }
-                activePeerConnections.clear();
-                
-                // Close server sockets
-                closeSocket(messagingSocket);
-                closeSocket(fileTransferSocket);
-                closeSocket(discoverySocket);
-                
-                // Clear discovered peers
-                discoveredPeers.clear();
-                
-                // Update state
-                setConnectionState(ConnectionState.DISCONNECTED);
-                
-                Log.i(TAG, "Disconnected from P2P network");
-                
-            } finally {
-                lock.writeLock().unlock();
+    public void disconnect() {
+        lock.writeLock().lock();
+        try {
+            Log.d(TAG, "Disconnecting from P2P network");
+            
+            // Stop discovery
+            stopDiscovery();
+            
+            // Close all peer connections
+            for (PeerConnection connection : activePeerConnections.values()) {
+                connection.close();
             }
-        }, executorService);
+            activePeerConnections.clear();
+            
+            // Close server sockets
+            closeSocket(messagingSocket);
+            closeSocket(fileTransferSocket);
+            
+            // Clear discovered peers
+            discoveredPeers.clear();
+            
+            // Update state
+            connectionState = ConnectionState.DISCONNECTED;
+            
+            Log.i(TAG, "Disconnected from P2P network");
+            
+        } finally {
+            lock.writeLock().unlock();
+        }
     }
     
     @Override
@@ -207,121 +200,140 @@ public class LocalNetworkManager implements NetworkManager {
     
     @Override
     public ConnectionMetrics getConnectionMetrics() {
-        return connectionMetrics;
+        return connectionMetrics.copy();
     }
     
     @Override
     public CompletableFuture<AuthResult> authenticateUser(UserCredentials credentials) {
-        // P2P mode doesn't require traditional authentication
+        // In P2P mode, authentication is local only
         return CompletableFuture.supplyAsync(() -> {
-            Log.d(TAG, "P2P mode: Setting local user from credentials");
-            
-            localUsername = credentials.getUsername();
-            
-            // Create user profile
-            localUserProfile = new UserProfile();
-            localUserProfile.setUsername(credentials.getUsername());
-            localUserProfile.setEmail(credentials.getEmail());
-            localUserProfile.setDisplayName(credentials.getUsername()); // Use username as display name
-            
-            // Store in preferences
-            SharedPreferencesManager.getInstance().setLocalUsername(localUsername);
-            SharedPreferencesManager.getInstance().setUserProfile(localUserProfile);
-            
-            Log.i(TAG, "Local user set: " + localUsername);
-            return new AuthResult(true, "local_session", "Local user authenticated");
-        });
+            try {
+                Log.d(TAG, "Local authentication for user: " + credentials.getUsername());
+                
+                // Create local user profile
+                UserProfile profile = new UserProfile();
+                profile.setUsername(credentials.getUsername());
+                profile.setEmail(credentials.getEmail());
+                profile.setPassword(credentials.getPassword());
+                
+                this.localUserProfile = profile;
+                
+                // Store locally
+                SharedPreferencesManager.getInstance().setUserProfile(profile);
+                
+                return new AuthResult(true, localPeerId, "Local authentication successful");
+                
+            } catch (Exception e) {
+                Log.e(TAG, "Local authentication error", e);
+                return new AuthResult(false, null, "Authentication error: " + e.getMessage());
+            }
+        }, executorService);
     }
     
     @Override
     public CompletableFuture<AuthResult> registerUser(UserProfile userInfo) {
-        // P2P mode treats registration same as authentication
-        UserCredentials credentials = new UserCredentials(userInfo.getUsername(), "", userInfo.getEmail());
-        return authenticateUser(credentials);
+        // In P2P mode, registration is local only
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                Log.d(TAG, "Local registration for user: " + userInfo.getUsername());
+                
+                this.localUserProfile = userInfo;
+                
+                // Store locally
+                SharedPreferencesManager.getInstance().setUserProfile(userInfo);
+                
+                return new AuthResult(true, localPeerId, "Local registration successful");
+                
+            } catch (Exception e) {
+                Log.e(TAG, "Local registration error", e);
+                return new AuthResult(false, null, "Registration error: " + e.getMessage());
+            }
+        }, executorService);
     }
     
     @Override
     public CompletableFuture<List<User>> searchUsers(String query) {
         return CompletableFuture.supplyAsync(() -> {
-            Log.d(TAG, "Searching for peers with query: " + query);
-            
             List<User> users = new ArrayList<>();
             
-            // Search discovered peers
+            // Search among discovered peers
             for (DiscoveredPeer peer : discoveredPeers.values()) {
-                if (peer.getDisplayName().toLowerCase().contains(query.toLowerCase()) ||
-                    peer.getUsername().toLowerCase().contains(query.toLowerCase())) {
+                if (peer.getUsername().toLowerCase().contains(query.toLowerCase()) ||
+                    peer.getDisplayName().toLowerCase().contains(query.toLowerCase())) {
                     
-                    User user = new User();
-                    user.setId(peer.getPeerId());
-                    user.setUsername(peer.getUsername());
+                    User user = new User(peer.getPeerId(), peer.getUsername(), peer.getDisplayName());
                     user.setStatus(peer.isOnline() ? UserStatus.ONLINE : UserStatus.OFFLINE);
+                    user.setLastSeen(peer.getLastSeen());
                     users.add(user);
                 }
             }
             
-            Log.d(TAG, "Found " + users.size() + " matching peers");
+            Log.d(TAG, "Found " + users.size() + " users for query: " + query);
             return users;
         }, executorService);
     }
     
     @Override
-    public CompletableFuture<UpdateResult> updateProfile(UserProfile profile) {
+    public CompletableFuture<Boolean> updateProfile(UserProfile profile) {
         return CompletableFuture.supplyAsync(() -> {
-            lock.writeLock().lock();
             try {
                 this.localUserProfile = profile;
                 SharedPreferencesManager.getInstance().setUserProfile(profile);
                 
                 // Broadcast updated profile to peers
-                broadcastStatusUpdate();
+                broadcastPresence();
                 
-                Log.d(TAG, "Local profile updated");
-                return new UpdateResult(true, "Profile updated successfully");
-                
-            } finally {
-                lock.writeLock().unlock();
+                return true;
+            } catch (Exception e) {
+                Log.e(TAG, "Profile update error", e);
+                return false;
             }
         }, executorService);
     }
     
     @Override
     public CompletableFuture<Void> logout() {
-        return disconnect();
+        return CompletableFuture.runAsync(() -> {
+            // Clear local profile
+            this.localUserProfile = null;
+            SharedPreferencesManager.getInstance().clearUserSession();
+            
+            // Disconnect from network
+            disconnect();
+        }, executorService);
     }
     
     @Override
     public CompletableFuture<Void> sendMessage(String recipientId, String messageType, Object messageData) {
         return CompletableFuture.runAsync(() -> {
             try {
-                Log.d(TAG, "Sending P2P message to: " + recipientId + ", type: " + messageType);
-                
-                // Find peer
-                DiscoveredPeer peer = discoveredPeers.get(recipientId);
-                if (peer == null) {
-                    throw new RuntimeException("Peer not found: " + recipientId);
+                PeerConnection connection = activePeerConnections.get(recipientId);
+                if (connection == null) {
+                    // Try to connect if not connected
+                    if (!connectToPeer(recipientId).get(5, TimeUnit.SECONDS)) {
+                        throw new RuntimeException("Failed to connect to peer");
+                    }
+                    connection = activePeerConnections.get(recipientId);
                 }
                 
-                // Create message
-                P2PMessage message = new P2PMessage();
-                message.setType(messageType);
-                message.setData(messageData);
-                message.setSenderId(localUsername);
-                message.setTimestamp(System.currentTimeMillis());
-                
-                // Send message
-                if (!sendDirectMessage(peer, message)) {
-                    // Queue for retry if peer is offline
-                    QueuedMessage queuedMsg = new QueuedMessage(recipientId, message);
-                    messageQueue.offer(queuedMsg);
-                    throw new RuntimeException("Failed to send message, queued for retry");
+                if (connection != null) {
+                    P2PMessage message = new P2PMessage();
+                    message.setType(messageType);
+                    message.setData(messageData);
+                    message.setSenderId(localPeerId);
+                    message.setTimestamp(System.currentTimeMillis());
+                    
+                    connection.sendMessage(message);
+                    Log.d(TAG, "Message sent to peer: " + recipientId);
+                } else {
+                    throw new RuntimeException("No connection to peer");
                 }
-                
-                Log.d(TAG, "P2P message sent successfully");
                 
             } catch (Exception e) {
-                Log.e(TAG, "P2P message send error", e);
-                throw new RuntimeException("P2P message send error", e);
+                Log.e(TAG, "Failed to send message", e);
+                // Queue message for later delivery
+                queueMessage(recipientId, messageType, messageData);
+                throw new RuntimeException("Message send failed", e);
             }
         }, executorService);
     }
@@ -333,6 +345,7 @@ public class LocalNetworkManager implements NetworkManager {
         messageData.put("message_uuid", UUID.randomUUID().toString());
         messageData.put("encrypted_content", Base64.getEncoder().encodeToString(encryptedContent));
         messageData.put("content_type", "text");
+        messageData.put("content_hash", generateContentHash(encryptedContent));
         
         return sendMessage(recipientId, MSG_USER_MESSAGE, messageData);
     }
@@ -342,20 +355,40 @@ public class LocalNetworkManager implements NetworkManager {
         Map<String, Object> messageData = new HashMap<>();
         messageData.put("chat_uuid", chatUuid);
         messageData.put("public_key", Base64.getEncoder().encodeToString(publicKey));
-        messageData.put("step", "request");
         
-        return sendMessage(recipientId, MSG_CHAT_INIT, messageData);
+        // CRITICAL: In P2P mode, we MUST send crypto algorithms
+        CryptoAlgorithms algorithms = SharedPreferencesManager.getInstance().getCryptoAlgorithms();
+        Map<String, String> cryptoAlgorithms = new HashMap<>();
+        cryptoAlgorithms.put("asymmetric", algorithms.getKemAlgorithm());
+        cryptoAlgorithms.put("symmetric", algorithms.getSymmetricAlgorithm());
+        cryptoAlgorithms.put("signature", algorithms.getSignatureAlgorithm());
+        messageData.put("crypto_algorithms", cryptoAlgorithms);
+        
+        Log.d(TAG, "Sending chat init request with algorithms: " + cryptoAlgorithms);
+        
+        return sendMessage(recipientId, MSG_CHAT_INIT_REQUEST, messageData);
     }
     
     @Override
-    public CompletableFuture<Void> sendChatInitResponse(String recipientId, String chatUuid, byte[] publicKey, byte[] kemCapsule, byte[] userSignature) {
+    public CompletableFuture<Void> sendChatInitResponse(String recipientId, String chatUuid, 
+                                                       byte[] publicKey, byte[] kemCapsule, byte[] userSignature) {
         Map<String, Object> messageData = new HashMap<>();
         messageData.put("chat_uuid", chatUuid);
         messageData.put("public_key", Base64.getEncoder().encodeToString(publicKey));
         messageData.put("kem_capsule", Base64.getEncoder().encodeToString(kemCapsule));
-        messageData.put("step", "response");
+        messageData.put("user_signature", Base64.getEncoder().encodeToString(userSignature));
         
-        return sendMessage(recipientId, MSG_CHAT_INIT, messageData);
+        // CRITICAL: In P2P mode, we MUST send crypto algorithms
+        CryptoAlgorithms algorithms = SharedPreferencesManager.getInstance().getCryptoAlgorithms();
+        Map<String, String> cryptoAlgorithms = new HashMap<>();
+        cryptoAlgorithms.put("asymmetric", algorithms.getKemAlgorithm());
+        cryptoAlgorithms.put("symmetric", algorithms.getSymmetricAlgorithm());
+        cryptoAlgorithms.put("signature", algorithms.getSignatureAlgorithm());
+        messageData.put("crypto_algorithms", cryptoAlgorithms);
+        
+        Log.d(TAG, "Sending chat init response with algorithms: " + cryptoAlgorithms);
+        
+        return sendMessage(recipientId, MSG_CHAT_INIT_RESPONSE, messageData);
     }
     
     @Override
@@ -363,153 +396,164 @@ public class LocalNetworkManager implements NetworkManager {
         Map<String, Object> messageData = new HashMap<>();
         messageData.put("chat_uuid", chatUuid);
         messageData.put("kem_capsule", Base64.getEncoder().encodeToString(kemCapsule));
-        messageData.put("step", "confirm");
         
-        return sendMessage(recipientId, MSG_CHAT_INIT, messageData);
+        return sendMessage(recipientId, MSG_CHAT_INIT_CONFIRM, messageData);
     }
     
     @Override
     public CompletableFuture<Void> sendChatInitSignature(String recipientId, String chatUuid, byte[] signature) {
         Map<String, Object> messageData = new HashMap<>();
         messageData.put("chat_uuid", chatUuid);
-        messageData.put("digital_signature", Base64.getEncoder().encodeToString(signature));
-        messageData.put("step", "signature");
+        messageData.put("signature", Base64.getEncoder().encodeToString(signature));
         
-        return sendMessage(recipientId, MSG_CHAT_INIT, messageData);
+        return sendMessage(recipientId, MSG_CHAT_INIT_SIGNATURE, messageData);
     }
     
     @Override
     public CompletableFuture<Void> sendChatDelete(String recipientId, String chatUuid) {
         Map<String, Object> messageData = new HashMap<>();
         messageData.put("chat_uuid", chatUuid);
-        messageData.put("delete_reason", "user_initiated");
+        messageData.put("reason", "user_initiated");
         
-        return sendMessage(recipientId, "CHAT_DELETE", messageData);
+        return sendMessage(recipientId, MSG_CHAT_DELETE, messageData);
     }
     
     @Override
     public CompletableFuture<ChatResult> createChat(List<String> participantIds) {
         return CompletableFuture.supplyAsync(() -> {
-            if (participantIds.size() != 1) {
-                return new ChatResult(false, null, "P2P mode supports only 1-to-1 chats");
+            try {
+                if (participantIds == null || participantIds.isEmpty()) {
+                    return new ChatResult(false, null, "No participants specified");
+                }
+                
+                String peerId = participantIds.get(0);
+                String chatUuid = UUID.randomUUID().toString();
+                
+                // Ensure connection to peer
+                if (!activePeerConnections.containsKey(peerId)) {
+                    if (!connectToPeer(peerId).get(5, TimeUnit.SECONDS)) {
+                        return new ChatResult(false, null, "Failed to connect to peer");
+                    }
+                }
+                
+                // Create local chat object
+                Chat chat = new Chat();
+                chat.setId(chatUuid);
+                chat.setName("Chat with " + peerId);
+                chat.setLastActivity(System.currentTimeMillis());
+                
+                // Store chat locally
+                DatabaseManager.getInstance().saveChat(chat);
+                
+                return new ChatResult(true, chat, "Chat created successfully");
+                
+            } catch (Exception e) {
+                Log.e(TAG, "Chat creation error", e);
+                return new ChatResult(false, null, "Chat creation error: " + e.getMessage());
             }
-            
-            String recipientId = participantIds.get(0);
-            String chatUuid = UUID.randomUUID().toString();
-            
-            // P2P mode: Chat creation is just generating UUID
-            // Actual chat initialization happens through crypto handshake
-            Chat chat = new Chat();
-            chat.setId(chatUuid);
-            chat.setName("Chat with " + recipientId);
-            chat.setLastActivity(System.currentTimeMillis());
-            
-            Log.d(TAG, "P2P chat created: " + chatUuid);
-            return new ChatResult(true, chat, "P2P chat created");
         }, executorService);
     }
     
-    // The following methods are not applicable to P2P mode or return empty/default values
-    
     @Override
     public CompletableFuture<List<Chat>> getChatList() {
-        // P2P mode: Chats are managed locally
-        return CompletableFuture.completedFuture(new ArrayList<>());
+        return CompletableFuture.supplyAsync(() -> {
+            // Return chats from local database
+            return DatabaseManager.getInstance().getAllChats();
+        }, executorService);
     }
     
     @Override
     public CompletableFuture<Chat> getChatInfo(String chatId) {
-        return CompletableFuture.completedFuture(null);
+        return CompletableFuture.supplyAsync(() -> {
+            // Get chat from local database
+            return DatabaseManager.getInstance().getChat(chatId);
+        }, executorService);
     }
     
     @Override
     public CompletableFuture<Boolean> deleteChat(String chatId) {
-        return CompletableFuture.completedFuture(true);
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                // Delete from local database
+                DatabaseManager.getInstance().deleteChat(chatId);
+                return true;
+            } catch (Exception e) {
+                Log.e(TAG, "Chat deletion error", e);
+                return false;
+            }
+        }, executorService);
     }
     
     @Override
     public CompletableFuture<Boolean> clearChatHistory(String chatId) {
-        return CompletableFuture.completedFuture(true);
+        return CompletableFuture.supplyAsync(() -> {
+            try {
+                // Clear messages from local database
+                DatabaseManager.getInstance().clearChatMessages(chatId);
+                return true;
+            } catch (Exception e) {
+                Log.e(TAG, "Clear chat history error", e);
+                return false;
+            }
+        }, executorService);
     }
     
     @Override
     public CompletableFuture<UploadResult> uploadFile(FileInfo file) {
+        // P2P file transfer implementation
         return CompletableFuture.supplyAsync(() -> {
-            // P2P mode: File upload means preparing for direct transfer
-            try {
-                String fileId = UUID.randomUUID().toString();
-                
-                // File will be transferred directly to peers when requested
-                Log.d(TAG, "File prepared for P2P transfer: " + file.getName());
-                return new UploadResult(true, fileId, "p2p://" + fileId, "File ready for P2P transfer");
-                
-            } catch (Exception e) {
-                Log.e(TAG, "File preparation error", e);
-                return new UploadResult(false, null, null, "File preparation error: " + e.getMessage());
-            }
+            // Not implemented in current version
+            return new UploadResult(false, null, "P2P file transfer not implemented");
         }, executorService);
     }
     
     @Override
     public CompletableFuture<DownloadResult> downloadFile(String fileId) {
+        // P2P file transfer implementation
         return CompletableFuture.supplyAsync(() -> {
-            try {
-                // P2P mode: Download means requesting file from peer
-                Log.d(TAG, "Requesting P2P file download: " + fileId);
-                
-                // TODO: Implement P2P file request protocol
-                return new DownloadResult(false, null, null, "P2P file download not implemented yet");
-                
-            } catch (Exception e) {
-                Log.e(TAG, "P2P file download error", e);
-                return new DownloadResult(false, null, null, "P2P file download error: " + e.getMessage());
-            }
+            // Not implemented in current version
+            return new DownloadResult(false, null, "P2P file transfer not implemented");
         }, executorService);
     }
     
     @Override
     public CompletableFuture<TransferResult> transferFile(String recipientId, FileInfo file) {
+        // P2P file transfer implementation
         return CompletableFuture.supplyAsync(() -> {
-            try {
-                Log.d(TAG, "Starting P2P file transfer to: " + recipientId);
-                
-                // Find peer
-                DiscoveredPeer peer = discoveredPeers.get(recipientId);
-                if (peer == null) {
-                    return new TransferResult(false, null, "Peer not found: " + recipientId);
-                }
-                
-                // TODO: Implement direct P2P file transfer
-                String transferId = UUID.randomUUID().toString();
-                
-                return new TransferResult(true, transferId, "P2P file transfer initiated");
-                
-            } catch (Exception e) {
-                Log.e(TAG, "P2P file transfer error", e);
-                return new TransferResult(false, null, "P2P file transfer error: " + e.getMessage());
-            }
+            // Not implemented in current version
+            return new TransferResult(false, null, "P2P file transfer not implemented");
         }, executorService);
     }
     
     @Override
     public CompletableFuture<Void> setMessageStatus(String messageId, MessageStatus status) {
-        // P2P mode: Message status handled locally
-        return CompletableFuture.completedFuture(null);
+        return CompletableFuture.runAsync(() -> {
+            // Update status in local database
+            DatabaseManager.getInstance().updateMessageStatus(messageId, status);
+        }, executorService);
     }
     
     @Override
     public CompletableFuture<Void> setUserStatus(UserStatus status) {
         return CompletableFuture.runAsync(() -> {
-            // Update local status and broadcast to peers
-            Log.d(TAG, "Setting P2P user status: " + status);
+            // Broadcast status update to all connected peers
+            Map<String, Object> statusData = new HashMap<>();
+            statusData.put("status", status.toString());
+            statusData.put("timestamp", System.currentTimeMillis());
             
-            if (localUserProfile != null) {
-                // Update profile metadata with status
-                Map<String, Object> statusInfo = new HashMap<>();
-                statusInfo.put("status", status.name());
-                statusInfo.put("timestamp", System.currentTimeMillis());
-                
-                broadcastStatusUpdate();
+            P2PMessage statusMessage = new P2PMessage();
+            statusMessage.setType(MSG_STATUS_UPDATE);
+            statusMessage.setData(statusData);
+            statusMessage.setSenderId(localPeerId);
+            statusMessage.setTimestamp(System.currentTimeMillis());
+            
+            // Send to all connected peers
+            for (PeerConnection connection : activePeerConnections.values()) {
+                try {
+                    connection.sendMessage(statusMessage);
+                } catch (Exception e) {
+                    Log.e(TAG, "Failed to send status update to peer", e);
+                }
             }
         }, executorService);
     }
@@ -518,8 +562,8 @@ public class LocalNetworkManager implements NetworkManager {
     public CompletableFuture<UserStatus> getUserStatus(String userId) {
         return CompletableFuture.supplyAsync(() -> {
             DiscoveredPeer peer = discoveredPeers.get(userId);
-            if (peer != null) {
-                return peer.isOnline() ? UserStatus.ONLINE : UserStatus.OFFLINE;
+            if (peer != null && peer.isOnline()) {
+                return UserStatus.ONLINE;
             }
             return UserStatus.OFFLINE;
         }, executorService);
@@ -546,7 +590,7 @@ public class LocalNetworkManager implements NetworkManager {
     /**
      * Start device discovery
      */
-    public boolean startDiscovery() {
+    private boolean startDiscovery() {
         lock.writeLock().lock();
         try {
             if (isDiscovering.get()) {
@@ -562,10 +606,15 @@ public class LocalNetworkManager implements NetworkManager {
             }
             
             // Start discovery listener
-            startDiscoveryListener();
+            executorService.submit(new DiscoveryListenerTask());
             
             // Start periodic discovery broadcasts
-            startDiscoveryBroadcast();
+            discoveryBroadcastTask = scheduler.scheduleAtFixedRate(
+                this::broadcastPresence,
+                0,
+                DISCOVERY_INTERVAL_MS,
+                TimeUnit.MILLISECONDS
+            );
             
             isDiscovering.set(true);
             Log.i(TAG, "P2P device discovery started");
@@ -582,7 +631,7 @@ public class LocalNetworkManager implements NetworkManager {
     /**
      * Stop device discovery
      */
-    public void stopDiscovery() {
+    private void stopDiscovery() {
         lock.writeLock().lock();
         try {
             if (!isDiscovering.get()) {
@@ -593,6 +642,13 @@ public class LocalNetworkManager implements NetworkManager {
             
             isDiscovering.set(false);
             
+            // Cancel broadcast task
+            if (discoveryBroadcastTask != null) {
+                discoveryBroadcastTask.cancel(true);
+                discoveryBroadcastTask = null;
+            }
+            
+            // Close discovery socket
             if (discoverySocket != null) {
                 discoverySocket.close();
                 discoverySocket = null;
@@ -606,40 +662,35 @@ public class LocalNetworkManager implements NetworkManager {
     }
     
     /**
-     * Get discovered peers
-     */
-    public List<DiscoveredPeer> getDiscoveredPeers() {
-        return new ArrayList<>(discoveredPeers.values());
-    }
-    
-    /**
      * Broadcast presence to other peers
      */
-    public void broadcastPresence(UserProfile userProfile) {
-        if (!isDiscovering.get()) {
-            Log.w(TAG, "Cannot broadcast presence - discovery not active");
+    private void broadcastPresence() {
+        if (!isDiscovering.get() || localUserProfile == null) {
             return;
         }
         
         try {
-            this.localUserProfile = userProfile;
-            
             DiscoveryMessage discoveryMsg = new DiscoveryMessage();
             discoveryMsg.setType(MSG_DISCOVERY_REQUEST);
-            discoveryMsg.setUsername(userProfile.getUsername());
-            discoveryMsg.setDisplayName(userProfile.getDisplayName());
-            discoveryMsg.setPeerId(generatePeerId());
+            discoveryMsg.setUsername(localUserProfile.getUsername());
+            discoveryMsg.setDisplayName(localUserProfile.getDisplayName());
+            discoveryMsg.setPeerId(localPeerId);
             discoveryMsg.setTimestamp(System.currentTimeMillis());
             
             String messageJson = gson.toJson(discoveryMsg);
             byte[] messageBytes = messageJson.getBytes(StandardCharsets.UTF_8);
             
             InetAddress group = InetAddress.getByName(MULTICAST_GROUP);
-            DatagramPacket packet = new DatagramPacket(messageBytes, messageBytes.length, group, DISCOVERY_PORT);
+            DatagramPacket packet = new DatagramPacket(
+                messageBytes, 
+                messageBytes.length, 
+                group, 
+                DISCOVERY_PORT
+            );
             
-            if (discoverySocket != null) {
+            if (discoverySocket != null && !discoverySocket.isClosed()) {
                 discoverySocket.send(packet);
-                Log.d(TAG, "Presence broadcast sent");
+                Log.v(TAG, "Presence broadcast sent");
             }
             
         } catch (Exception e) {
@@ -650,7 +701,7 @@ public class LocalNetworkManager implements NetworkManager {
     /**
      * Connect to specific peer
      */
-    public CompletableFuture<Boolean> connectToPeer(String peerId) {
+    private CompletableFuture<Boolean> connectToPeer(String peerId) {
         return CompletableFuture.supplyAsync(() -> {
             try {
                 DiscoveredPeer peer = discoveredPeers.get(peerId);
@@ -659,10 +710,16 @@ public class LocalNetworkManager implements NetworkManager {
                     return false;
                 }
                 
+                // Check if already connected
+                if (activePeerConnections.containsKey(peerId)) {
+                    return true;
+                }
+                
                 Log.d(TAG, "Connecting to peer: " + peerId);
                 
                 // Create direct socket connection
                 Socket socket = new Socket();
+                socket.setSoTimeout(SOCKET_TIMEOUT_MS);
                 socket.connect(new InetSocketAddress(peer.getIpAddress(), MESSAGING_PORT), CONNECTION_TIMEOUT_MS);
                 
                 // Create peer connection
@@ -670,7 +727,7 @@ public class LocalNetworkManager implements NetworkManager {
                 activePeerConnections.put(peerId, connection);
                 
                 // Start connection handler
-                startPeerConnectionHandler(connection);
+                executorService.submit(new PeerConnectionHandler(connection));
                 
                 Log.i(TAG, "Connected to peer: " + peerId);
                 return true;
@@ -681,35 +738,6 @@ public class LocalNetworkManager implements NetworkManager {
             }
         }, executorService);
     }
-    
-    /**
-     * Disconnect from peer
-     */
-    public void disconnectFromPeer(String peerId) {
-        PeerConnection connection = activePeerConnections.remove(peerId);
-        if (connection != null) {
-            connection.close();
-            Log.d(TAG, "Disconnected from peer: " + peerId);
-        }
-    }
-    
-    /**
-     * Add P2P message listener
-     */
-    public void addMessageListener(P2PMessageListener listener) {
-        messageListeners.add(listener);
-    }
-    
-    /**
-     * Remove P2P message listener
-     */
-    public void removeMessageListener(P2PMessageListener listener) {
-        messageListeners.remove(listener);
-    }
-    
-    // ===========================
-    // PRIVATE HELPER METHODS
-    // ===========================
     
     /**
      * Initialize network components
@@ -769,91 +797,155 @@ public class LocalNetworkManager implements NetworkManager {
     }
     
     /**
-     * Start discovery listener
+     * Handle incoming discovery message
      */
-    private void startDiscoveryListener() {
-        executorService.submit(new DiscoveryListenerTask());
-    }
-    
-    /**
-     * Start discovery broadcast
-     */
-    private void startDiscoveryBroadcast() {
-        scheduler.scheduleAtFixedRate(new DiscoveryBroadcastTask(), 0, DISCOVERY_INTERVAL_MS, TimeUnit.MILLISECONDS);
-    }
-    
-    /**
-     * Send direct message to peer
-     */
-    private boolean sendDirectMessage(DiscoveredPeer peer, P2PMessage message) {
+    private void handleDiscoveryMessage(String message, InetAddress senderAddress) {
         try {
-            PeerConnection connection = activePeerConnections.get(peer.getPeerId());
-            if (connection == null || !connection.isConnected()) {
-                // Try to establish connection
-                if (!connectToPeer(peer.getPeerId()).get(5, TimeUnit.SECONDS)) {
-                    return false;
-                }
-                connection = activePeerConnections.get(peer.getPeerId());
+            DiscoveryMessage discoveryMsg = gson.fromJson(message, DiscoveryMessage.class);
+            
+            // Ignore our own broadcasts
+            if (discoveryMsg.getPeerId().equals(localPeerId)) {
+                return;
             }
             
-            if (connection != null) {
-                return connection.sendMessage(message);
+            // Create or update discovered peer
+            DiscoveredPeer peer = new DiscoveredPeer();
+            peer.setPeerId(discoveryMsg.getPeerId());
+            peer.setUsername(discoveryMsg.getUsername());
+            peer.setDisplayName(discoveryMsg.getDisplayName());
+            peer.setIpAddress(senderAddress.getHostAddress());
+            peer.setLastSeen(System.currentTimeMillis());
+            peer.setOnline(true);
+            
+            discoveredPeers.put(peer.getPeerId(), peer);
+            
+            Log.d(TAG, "Discovered peer: " + peer.getDisplayName() + " at " + peer.getIpAddress());
+            
+            // Send discovery response
+            if (MSG_DISCOVERY_REQUEST.equals(discoveryMsg.getType())) {
+                sendDiscoveryResponse(senderAddress);
             }
             
-            return false;
+            // Notify listeners
+            notifyPeerDiscovered(peer);
+            
         } catch (Exception e) {
-            Log.e(TAG, "Failed to send direct message to peer: " + peer.getPeerId(), e);
-            return false;
+            Log.e(TAG, "Failed to handle discovery message", e);
         }
     }
     
     /**
-     * Broadcast status update to all peers
+     * Send discovery response
      */
-    private void broadcastStatusUpdate() {
-        if (localUserProfile != null) {
-            Map<String, Object> statusData = new HashMap<>();
-            statusData.put("username", localUserProfile.getUsername());
-            statusData.put("display_name", localUserProfile.getDisplayName());
-            statusData.put("timestamp", System.currentTimeMillis());
-            
-            P2PMessage statusMessage = new P2PMessage();
-            statusMessage.setType(MSG_STATUS_UPDATE);
-            statusMessage.setData(statusData);
-            statusMessage.setSenderId(localUsername);
-            statusMessage.setTimestamp(System.currentTimeMillis());
-            
-            for (DiscoveredPeer peer : discoveredPeers.values()) {
-                sendDirectMessage(peer, statusMessage);
-            }
+    private void sendDiscoveryResponse(InetAddress targetAddress) {
+        if (localUserProfile == null) {
+            return;
         }
-    }
-    
-    /**
-     * Start peer connection handler
-     */
-    private void startPeerConnectionHandler(PeerConnection connection) {
-        executorService.submit(new PeerConnectionTask(connection));
-    }
-    
-    /**
-     * Set connection state and notify
-     */
-    private void setConnectionState(ConnectionState state) {
-        ConnectionState oldState = this.connectionState;
-        this.connectionState = state;
         
-        if (oldState != state) {
-            Log.d(TAG, "P2P connection state changed: " + oldState + " -> " + state);
+        try {
+            DiscoveryMessage response = new DiscoveryMessage();
+            response.setType(MSG_DISCOVERY_RESPONSE);
+            response.setUsername(localUserProfile.getUsername());
+            response.setDisplayName(localUserProfile.getDisplayName());
+            response.setPeerId(localPeerId);
+            response.setTimestamp(System.currentTimeMillis());
             
-            // Update metrics
-            if (state == ConnectionState.CONNECTED) {
-                connectionMetrics.setConnectionType("P2P");
-                connectionMetrics.setConnectedTime(System.currentTimeMillis());
+            String messageJson = gson.toJson(response);
+            byte[] messageBytes = messageJson.getBytes(StandardCharsets.UTF_8);
+            
+            DatagramPacket packet = new DatagramPacket(
+                messageBytes,
+                messageBytes.length,
+                targetAddress,
+                DISCOVERY_PORT
+            );
+            
+            if (discoverySocket != null && !discoverySocket.isClosed()) {
+                discoverySocket.send(packet);
             }
             
-            // Notify StateManager
-            StateManager.getInstance().setConnectionState(state);
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to send discovery response", e);
+        }
+    }
+    
+    /**
+     * Handle incoming P2P message
+     */
+    private void handleP2PMessage(P2PMessage message, String fromPeerId) {
+        try {
+            Log.d(TAG, "Handling P2P message type: " + message.getType() + " from " + fromPeerId);
+            
+            // Update peer last seen
+            DiscoveredPeer peer = discoveredPeers.get(fromPeerId);
+            if (peer != null) {
+                peer.setLastSeen(System.currentTimeMillis());
+            }
+            
+            // Notify listeners
+            for (P2PMessageListener listener : messageListeners) {
+                try {
+                    listener.onMessageReceived(message, fromPeerId);
+                } catch (Exception e) {
+                    Log.e(TAG, "Error in message listener", e);
+                }
+            }
+            
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to handle P2P message", e);
+        }
+    }
+    
+    /**
+     * Queue message for later delivery
+     */
+    private void queueMessage(String recipientId, String messageType, Object messageData) {
+        QueuedMessage queuedMessage = new QueuedMessage();
+        queuedMessage.recipientId = recipientId;
+        queuedMessage.messageType = messageType;
+        queuedMessage.messageData = messageData;
+        queuedMessage.timestamp = System.currentTimeMillis();
+        
+        messageQueue.offer(queuedMessage);
+        Log.d(TAG, "Message queued for later delivery to: " + recipientId);
+    }
+    
+    /**
+     * Process queued messages
+     */
+    private void processQueuedMessages() {
+        while (!messageQueue.isEmpty()) {
+            QueuedMessage queuedMessage = messageQueue.poll();
+            if (queuedMessage != null && activePeerConnections.containsKey(queuedMessage.recipientId)) {
+                sendMessage(queuedMessage.recipientId, queuedMessage.messageType, queuedMessage.messageData);
+            }
+        }
+    }
+    
+    /**
+     * Notify listeners about discovered peer
+     */
+    private void notifyPeerDiscovered(DiscoveredPeer peer) {
+        for (P2PMessageListener listener : messageListeners) {
+            try {
+                listener.onPeerDiscovered(peer);
+            } catch (Exception e) {
+                Log.e(TAG, "Error notifying peer discovered", e);
+            }
+        }
+    }
+    
+    /**
+     * Generate content hash
+     */
+    private String generateContentHash(byte[] content) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(content);
+            return Base64.getEncoder().encodeToString(hash);
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to generate content hash", e);
+            return "";
         }
     }
     
@@ -867,19 +959,6 @@ public class LocalNetworkManager implements NetworkManager {
     /**
      * Close socket safely
      */
-    private void closeSocket(Socket socket) {
-        if (socket != null && !socket.isClosed()) {
-            try {
-                socket.close();
-            } catch (IOException e) {
-                Log.w(TAG, "Error closing socket", e);
-            }
-        }
-    }
-    
-    /**
-     * Close server socket safely
-     */
     private void closeSocket(ServerSocket socket) {
         if (socket != null && !socket.isClosed()) {
             try {
@@ -891,20 +970,28 @@ public class LocalNetworkManager implements NetworkManager {
     }
     
     /**
-     * Close multicast socket safely
+     * Add P2P message listener
      */
-    private void closeSocket(MulticastSocket socket) {
-        if (socket != null && !socket.isClosed()) {
-            try {
-                socket.close();
-            } catch (Exception e) {
-                Log.w(TAG, "Error closing multicast socket", e);
-            }
-        }
+    public void addMessageListener(P2PMessageListener listener) {
+        messageListeners.add(listener);
+    }
+    
+    /**
+     * Remove P2P message listener
+     */
+    public void removeMessageListener(P2PMessageListener listener) {
+        messageListeners.remove(listener);
+    }
+    
+    /**
+     * Get discovered peers
+     */
+    public List<DiscoveredPeer> getDiscoveredPeers() {
+        return new ArrayList<>(discoveredPeers.values());
     }
     
     // ===========================
-    // BACKGROUND TASKS
+    // INNER CLASSES
     // ===========================
     
     /**
@@ -923,80 +1010,16 @@ public class LocalNetworkManager implements NetworkManager {
                     String message = new String(packet.getData(), 0, packet.getLength(), StandardCharsets.UTF_8);
                     handleDiscoveryMessage(message, packet.getAddress());
                     
+                } catch (SocketTimeoutException e) {
+                    // Normal timeout, continue
                 } catch (Exception e) {
                     if (isDiscovering.get()) {
                         Log.e(TAG, "Discovery listener error", e);
                     }
                 }
             }
-        }
-        
-        private void handleDiscoveryMessage(String message, InetAddress senderAddress) {
-            try {
-                DiscoveryMessage discoveryMsg = gson.fromJson(message, DiscoveryMessage.class);
-                
-                if (MSG_DISCOVERY_REQUEST.equals(discoveryMsg.getType())) {
-                    // Received discovery request from another peer
-                    if (!discoveryMsg.getUsername().equals(localUsername)) {
-                        // Add to discovered peers
-                        DiscoveredPeer peer = new DiscoveredPeer();
-                        peer.setPeerId(discoveryMsg.getPeerId());
-                        peer.setUsername(discoveryMsg.getUsername());
-                        peer.setDisplayName(discoveryMsg.getDisplayName());
-                        peer.setIpAddress(senderAddress.getHostAddress());
-                        peer.setLastSeen(System.currentTimeMillis());
-                        peer.setOnline(true);
-                        
-                        discoveredPeers.put(peer.getPeerId(), peer);
-                        
-                        // Send discovery response
-                        sendDiscoveryResponse(senderAddress);
-                        
-                        Log.d(TAG, "Discovered peer: " + peer.getUsername() + " at " + peer.getIpAddress());
-                    }
-                } else if (MSG_DISCOVERY_RESPONSE.equals(discoveryMsg.getType())) {
-                    // Received discovery response
-                    // Handle similar to request
-                }
-                
-            } catch (Exception e) {
-                Log.e(TAG, "Error handling discovery message", e);
-            }
-        }
-        
-        private void sendDiscoveryResponse(InetAddress targetAddress) {
-            try {
-                if (localUserProfile != null) {
-                    DiscoveryMessage response = new DiscoveryMessage();
-                    response.setType(MSG_DISCOVERY_RESPONSE);
-                    response.setUsername(localUserProfile.getUsername());
-                    response.setDisplayName(localUserProfile.getDisplayName());
-                    response.setPeerId(generatePeerId());
-                    response.setTimestamp(System.currentTimeMillis());
-                    
-                    String responseJson = gson.toJson(response);
-                    byte[] responseBytes = responseJson.getBytes(StandardCharsets.UTF_8);
-                    
-                    DatagramPacket packet = new DatagramPacket(
-                        responseBytes, responseBytes.length, targetAddress, DISCOVERY_PORT);
-                    
-                    discoverySocket.send(packet);
-                }
-            } catch (Exception e) {
-                Log.e(TAG, "Error sending discovery response", e);
-            }
-        }
-    }
-    
-    /**
-     * Discovery broadcast task
-     */
-    private class DiscoveryBroadcastTask implements Runnable {
-        @Override
-        public void run() {
-            if (localUserProfile != null) {
-                broadcastPresence(localUserProfile);
-            }
+            
+            Log.d(TAG, "Discovery listener stopped");
         }
     }
     
@@ -1006,33 +1029,26 @@ public class LocalNetworkManager implements NetworkManager {
     private class MessagingServerTask implements Runnable {
         @Override
         public void run() {
-            while (!messagingSocket.isClosed()) {
+            Log.d(TAG, "Messaging server started on port " + MESSAGING_PORT);
+            
+            while (messagingSocket != null && !messagingSocket.isClosed()) {
                 try {
                     Socket clientSocket = messagingSocket.accept();
+                    clientSocket.setSoTimeout(SOCKET_TIMEOUT_MS);
                     
-                    // Handle client in separate thread
+                    // Handle incoming connection
                     executorService.submit(() -> handleIncomingConnection(clientSocket));
                     
+                } catch (SocketTimeoutException e) {
+                    // Normal timeout, continue
                 } catch (Exception e) {
-                    if (!messagingSocket.isClosed()) {
+                    if (messagingSocket != null && !messagingSocket.isClosed()) {
                         Log.e(TAG, "Messaging server error", e);
                     }
                 }
             }
-        }
-        
-        private void handleIncomingConnection(Socket clientSocket) {
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()))) {
-                String messageJson = reader.readLine();
-                if (messageJson != null) {
-                    P2PMessage message = gson.fromJson(messageJson, P2PMessage.class);
-                    handleIncomingMessage(message);
-                }
-            } catch (Exception e) {
-                Log.e(TAG, "Error handling incoming connection", e);
-            } finally {
-                closeSocket(clientSocket);
-            }
+            
+            Log.d(TAG, "Messaging server stopped");
         }
     }
     
@@ -1042,7 +1058,9 @@ public class LocalNetworkManager implements NetworkManager {
     private class FileTransferServerTask implements Runnable {
         @Override
         public void run() {
-            while (!fileTransferSocket.isClosed()) {
+            Log.d(TAG, "File transfer server started on port " + FILE_TRANSFER_PORT);
+            
+            while (fileTransferSocket != null && !fileTransferSocket.isClosed()) {
                 try {
                     Socket clientSocket = fileTransferSocket.accept();
                     
@@ -1050,78 +1068,158 @@ public class LocalNetworkManager implements NetworkManager {
                     executorService.submit(() -> handleFileTransfer(clientSocket));
                     
                 } catch (Exception e) {
-                    if (!fileTransferSocket.isClosed()) {
+                    if (fileTransferSocket != null && !fileTransferSocket.isClosed()) {
                         Log.e(TAG, "File transfer server error", e);
                     }
                 }
             }
-        }
-        
-        private void handleFileTransfer(Socket clientSocket) {
-            // TODO: Implement file transfer protocol
-            Log.d(TAG, "File transfer request received");
-            closeSocket(clientSocket);
+            
+            Log.d(TAG, "File transfer server stopped");
         }
     }
     
     /**
-     * Peer connection task
+     * Handle incoming connection
      */
-    private class PeerConnectionTask implements Runnable {
+    private void handleIncomingConnection(Socket socket) {
+        try {
+            // Read peer identification
+            BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+            String peerIdLine = reader.readLine();
+            
+            if (peerIdLine != null && peerIdLine.startsWith("PEER_ID:")) {
+                String peerId = peerIdLine.substring(8);
+                DiscoveredPeer peer = discoveredPeers.get(peerId);
+                
+                if (peer != null) {
+                    PeerConnection connection = new PeerConnection(peer, socket);
+                    activePeerConnections.put(peerId, connection);
+                    
+                    // Start connection handler
+                    executorService.submit(new PeerConnectionHandler(connection));
+                    
+                    Log.d(TAG, "Accepted connection from peer: " + peerId);
+                } else {
+                    Log.w(TAG, "Unknown peer connection attempt: " + peerId);
+                    socket.close();
+                }
+            } else {
+                Log.w(TAG, "Invalid peer connection attempt");
+                socket.close();
+            }
+            
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to handle incoming connection", e);
+            try {
+                socket.close();
+            } catch (IOException ignore) {}
+        }
+    }
+    
+    /**
+     * Handle file transfer
+     */
+    private void handleFileTransfer(Socket socket) {
+        // TODO: Implement P2P file transfer
+        Log.d(TAG, "File transfer not implemented");
+        try {
+            socket.close();
+        } catch (IOException ignore) {}
+    }
+    
+    /**
+     * Peer connection handler
+     */
+    private class PeerConnectionHandler implements Runnable {
         private final PeerConnection connection;
         
-        public PeerConnectionTask(PeerConnection connection) {
+        public PeerConnectionHandler(PeerConnection connection) {
             this.connection = connection;
         }
         
         @Override
         public void run() {
             try {
-                while (connection.isConnected()) {
-                    P2PMessage message = connection.receiveMessage();
-                    if (message != null) {
-                        handleIncomingMessage(message);
+                // Send our peer ID
+                connection.sendRawMessage("PEER_ID:" + localPeerId);
+                
+                // Process queued messages for this peer
+                processQueuedMessages();
+                
+                // Read messages
+                BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(connection.getSocket().getInputStream())
+                );
+                
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    try {
+                        P2PMessage message = gson.fromJson(line, P2PMessage.class);
+                        handleP2PMessage(message, connection.getPeer().getPeerId());
+                    } catch (Exception e) {
+                        Log.e(TAG, "Failed to parse P2P message", e);
                     }
                 }
+                
             } catch (Exception e) {
-                Log.e(TAG, "Peer connection task error", e);
+                Log.e(TAG, "Peer connection error", e);
             } finally {
+                // Remove connection
+                activePeerConnections.remove(connection.getPeer().getPeerId());
                 connection.close();
+                
+                Log.d(TAG, "Peer connection closed: " + connection.getPeer().getPeerId());
             }
         }
     }
     
     /**
-     * Handle incoming P2P message
+     * Peer connection class
      */
-    private void handleIncomingMessage(P2PMessage message) {
-        Log.d(TAG, "Received P2P message: " + message.getType() + " from " + message.getSenderId());
+    private class PeerConnection {
+        private final DiscoveredPeer peer;
+        private final Socket socket;
+        private final PrintWriter writer;
         
-        // Notify listeners
-        for (P2PMessageListener listener : messageListeners) {
+        public PeerConnection(DiscoveredPeer peer, Socket socket) throws IOException {
+            this.peer = peer;
+            this.socket = socket;
+            this.writer = new PrintWriter(socket.getOutputStream(), true);
+        }
+        
+        public void sendMessage(P2PMessage message) throws IOException {
+            String json = gson.toJson(message);
+            writer.println(json);
+        }
+        
+        public void sendRawMessage(String message) {
+            writer.println(message);
+        }
+        
+        public DiscoveredPeer getPeer() {
+            return peer;
+        }
+        
+        public Socket getSocket() {
+            return socket;
+        }
+        
+        public void close() {
             try {
-                listener.onMessageReceived(message.getSenderId(), message.getType(), message.getData());
-            } catch (Exception e) {
-                Log.e(TAG, "Error notifying message listener", e);
+                writer.close();
+                socket.close();
+            } catch (IOException e) {
+                Log.e(TAG, "Error closing peer connection", e);
             }
         }
     }
     
     // ===========================
-    // INNER CLASSES AND INTERFACES
+    // DATA CLASSES
     // ===========================
     
     /**
-     * P2P message listener interface
-     */
-    public interface P2PMessageListener {
-        void onMessageReceived(String fromPeerId, String messageType, Object messageData);
-        void onPeerConnected(String peerId);
-        void onPeerDisconnected(String peerId);
-    }
-    
-    /**
-     * Discovered peer data class
+     * Discovered peer information
      */
     public static class DiscoveredPeer {
         private String peerId;
@@ -1152,7 +1250,7 @@ public class LocalNetworkManager implements NetworkManager {
     }
     
     /**
-     * P2P message data class
+     * P2P message
      */
     public static class P2PMessage {
         private String type;
@@ -1175,7 +1273,7 @@ public class LocalNetworkManager implements NetworkManager {
     }
     
     /**
-     * Discovery message data class
+     * Discovery message
      */
     private static class DiscoveryMessage {
         private String type;
@@ -1202,78 +1300,21 @@ public class LocalNetworkManager implements NetworkManager {
     }
     
     /**
-     * Peer connection wrapper
+     * Queued message
      */
-    private static class PeerConnection {
-        private final DiscoveredPeer peer;
-        private final Socket socket;
-        private final PrintWriter writer;
-        private final BufferedReader reader;
-        private volatile boolean connected;
-        
-        public PeerConnection(DiscoveredPeer peer, Socket socket) throws IOException {
-            this.peer = peer;
-            this.socket = socket;
-            this.writer = new PrintWriter(socket.getOutputStream(), true);
-            this.reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-            this.connected = true;
-        }
-        
-        public boolean isConnected() {
-            return connected && !socket.isClosed();
-        }
-        
-        public boolean sendMessage(P2PMessage message) {
-            try {
-                String messageJson = new Gson().toJson(message);
-                writer.println(messageJson);
-                return !writer.checkError();
-            } catch (Exception e) {
-                Log.e(TAG, "Error sending message to peer: " + peer.getPeerId(), e);
-                return false;
-            }
-        }
-        
-        public P2PMessage receiveMessage() throws IOException {
-            String messageJson = reader.readLine();
-            if (messageJson != null) {
-                return new Gson().fromJson(messageJson, P2PMessage.class);
-            }
-            return null;
-        }
-        
-        public void close() {
-            connected = false;
-            try {
-                if (!socket.isClosed()) {
-                    socket.close();
-                }
-            } catch (IOException e) {
-                Log.w(TAG, "Error closing peer connection", e);
-            }
-        }
-        
-        public DiscoveredPeer getPeer() {
-            return peer;
-        }
+    private static class QueuedMessage {
+        String recipientId;
+        String messageType;
+        Object messageData;
+        long timestamp;
     }
     
     /**
-     * Queued message for offline scenarios
+     * P2P message listener interface
      */
-    private static class QueuedMessage {
-        private final String recipientId;
-        private final P2PMessage message;
-        private final long queuedAt;
-        
-        public QueuedMessage(String recipientId, P2PMessage message) {
-            this.recipientId = recipientId;
-            this.message = message;
-            this.queuedAt = System.currentTimeMillis();
-        }
-        
-        public String getRecipientId() { return recipientId; }
-        public P2PMessage getMessage() { return message; }
-        public long getQueuedAt() { return queuedAt; }
+    public interface P2PMessageListener {
+        void onMessageReceived(P2PMessage message, String fromPeerId);
+        void onPeerDiscovered(DiscoveredPeer peer);
+        void onPeerDisconnected(String peerId);
     }
 }

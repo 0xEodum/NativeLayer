@@ -73,8 +73,7 @@ UIBridge.handleUIMethod("connectToServer") ->
   });
 ```
 
-## 4. Серверная авторизация (ОБНОВЛЕНО)
-
+## 4. Серверная авторизация
 **Сценарий: Вход пользователя на сервере (AuthScreen - server mode)**
 ```
 UIBridge.handleUIMethod("authenticateUser") ->
@@ -118,7 +117,7 @@ UIBridge.handleUIMethod("authenticateUser") ->
   });
 ```
 
-## 5. Локальная авторизация (ОБНОВЛЕНО)
+## 5. Локальная авторизация
 
 **Сценарий: Вход в локальном режиме (AuthScreen - local mode)**
 ```
