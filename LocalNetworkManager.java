@@ -62,7 +62,11 @@ public class LocalNetworkManager implements NetworkManager {
     private static final String MSG_DISCOVERY_REQUEST = "YUMSG_DISCOVERY_REQUEST";
     private static final String MSG_DISCOVERY_RESPONSE = "YUMSG_DISCOVERY_RESPONSE";
     private static final String MSG_USER_MESSAGE = "YUMSG_USER_MESSAGE";
-    private static final String MSG_CHAT_INIT = "YUMSG_CHAT_INIT";
+    private static final String MSG_CHAT_INIT_REQUEST = "YUMSG_CHAT_INIT_REQUEST";
+    private static final String MSG_CHAT_INIT_RESPONSE = "YUMSG_CHAT_INIT_RESPONSE";
+    private static final String MSG_CHAT_INIT_CONFIRM = "YUMSG_CHAT_INIT_CONFIRM";
+    private static final String MSG_CHAT_INIT_SIGNATURE = "YUMSG_CHAT_INIT_SIGNATURE";
+    private static final String MSG_CHAT_DELETE = "YUMSG_CHAT_DELETE";
     private static final String MSG_FILE_TRANSFER = "YUMSG_FILE_TRANSFER";
     private static final String MSG_STATUS_UPDATE = "YUMSG_STATUS_UPDATE";
     
@@ -342,9 +346,16 @@ public class LocalNetworkManager implements NetworkManager {
         Map<String, Object> messageData = new HashMap<>();
         messageData.put("chat_uuid", chatUuid);
         messageData.put("public_key", Base64.getEncoder().encodeToString(publicKey));
-        messageData.put("step", "request");
-        
-        return sendMessage(recipientId, MSG_CHAT_INIT, messageData);
+
+        // Include crypto algorithms for P2P mode
+        CryptoAlgorithms algorithms = SharedPreferencesManager.getInstance().getCryptoAlgorithms();
+        Map<String, String> cryptoAlgorithms = new HashMap<>();
+        cryptoAlgorithms.put("asymmetric", algorithms.getKemAlgorithm());
+        cryptoAlgorithms.put("symmetric", algorithms.getSymmetricAlgorithm());
+        cryptoAlgorithms.put("signature", algorithms.getSignatureAlgorithm());
+        messageData.put("crypto_algorithms", cryptoAlgorithms);
+
+        return sendMessage(recipientId, MSG_CHAT_INIT_REQUEST, messageData);
     }
     
     @Override
@@ -353,9 +364,17 @@ public class LocalNetworkManager implements NetworkManager {
         messageData.put("chat_uuid", chatUuid);
         messageData.put("public_key", Base64.getEncoder().encodeToString(publicKey));
         messageData.put("kem_capsule", Base64.getEncoder().encodeToString(kemCapsule));
-        messageData.put("step", "response");
-        
-        return sendMessage(recipientId, MSG_CHAT_INIT, messageData);
+        messageData.put("user_signature", Base64.getEncoder().encodeToString(userSignature));
+
+        // Include crypto algorithms for P2P mode
+        CryptoAlgorithms algorithms = SharedPreferencesManager.getInstance().getCryptoAlgorithms();
+        Map<String, String> cryptoAlgorithms = new HashMap<>();
+        cryptoAlgorithms.put("asymmetric", algorithms.getKemAlgorithm());
+        cryptoAlgorithms.put("symmetric", algorithms.getSymmetricAlgorithm());
+        cryptoAlgorithms.put("signature", algorithms.getSignatureAlgorithm());
+        messageData.put("crypto_algorithms", cryptoAlgorithms);
+
+        return sendMessage(recipientId, MSG_CHAT_INIT_RESPONSE, messageData);
     }
     
     @Override
@@ -363,19 +382,17 @@ public class LocalNetworkManager implements NetworkManager {
         Map<String, Object> messageData = new HashMap<>();
         messageData.put("chat_uuid", chatUuid);
         messageData.put("kem_capsule", Base64.getEncoder().encodeToString(kemCapsule));
-        messageData.put("step", "confirm");
-        
-        return sendMessage(recipientId, MSG_CHAT_INIT, messageData);
+
+        return sendMessage(recipientId, MSG_CHAT_INIT_CONFIRM, messageData);
     }
     
     @Override
     public CompletableFuture<Void> sendChatInitSignature(String recipientId, String chatUuid, byte[] signature) {
         Map<String, Object> messageData = new HashMap<>();
         messageData.put("chat_uuid", chatUuid);
-        messageData.put("digital_signature", Base64.getEncoder().encodeToString(signature));
-        messageData.put("step", "signature");
-        
-        return sendMessage(recipientId, MSG_CHAT_INIT, messageData);
+        messageData.put("signature", Base64.getEncoder().encodeToString(signature));
+
+        return sendMessage(recipientId, MSG_CHAT_INIT_SIGNATURE, messageData);
     }
     
     @Override
@@ -384,7 +401,7 @@ public class LocalNetworkManager implements NetworkManager {
         messageData.put("chat_uuid", chatUuid);
         messageData.put("delete_reason", "user_initiated");
         
-        return sendMessage(recipientId, "CHAT_DELETE", messageData);
+        return sendMessage(recipientId, MSG_CHAT_DELETE, messageData);
     }
     
     @Override

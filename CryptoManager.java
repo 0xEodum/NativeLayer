@@ -945,6 +945,20 @@ public class CryptoManager {
             throw new RuntimeException("Failed to serialize KEM private key", e);
         }
     }
+
+    /**
+     * Get encoded bytes for a KEM public key using the specified algorithm
+     */
+    public byte[] getPublicKeyBytes(AsymmetricKeyParameter publicKey, String algorithm) {
+        return kemPublicKeyToBytes(publicKey, algorithm);
+    }
+
+    /**
+     * Get encoded bytes for a KEM private key using the specified algorithm
+     */
+    public byte[] getPrivateKeyBytes(AsymmetricKeyParameter privateKey, String algorithm) {
+        return kemPrivateKeyToBytes(privateKey, algorithm);
+    }
     
     /**
      * Convert bytes to KEM public key
