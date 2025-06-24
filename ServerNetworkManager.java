@@ -422,14 +422,8 @@ public class ServerNetworkManager implements NetworkManager {
         Map<String, Object> messageData = new HashMap<>();
         messageData.put("chat_uuid", chatUuid);
         messageData.put("public_key", Base64.getEncoder().encodeToString(publicKey));
-        
-        // Get crypto algorithms from preferences
-        // TODO: Get from SharedPreferencesManager or pass as parameter
-        Map<String, String> cryptoAlgorithm = new HashMap<>();
-        cryptoAlgorithm.put("asymmetric", "KYBER");
-        cryptoAlgorithm.put("symmetric", "AES-256");
-        cryptoAlgorithm.put("signature", "FALCON");
-        messageData.put("crypto_algorithm", cryptoAlgorithm);
+
+        // Algorithms are unified for organization in server mode
         
         return sendMessage(recipientId, "CHAT_INIT_REQUEST", messageData);
     }
@@ -441,11 +435,8 @@ public class ServerNetworkManager implements NetworkManager {
         messageData.put("public_key", Base64.getEncoder().encodeToString(publicKey));
         messageData.put("kem_capsule", Base64.getEncoder().encodeToString(kemCapsule));
         
-        Map<String, String> cryptoAlgorithm = new HashMap<>();
-        cryptoAlgorithm.put("asymmetric", "KYBER");
-        cryptoAlgorithm.put("symmetric", "AES-256");
-        cryptoAlgorithm.put("signature", "FALCON");
-        messageData.put("crypto_algorithm", cryptoAlgorithm);
+        messageData.put("user_signature", Base64.getEncoder().encodeToString(userSignature));
+        // Algorithms are unified for organization in server mode
         
         return sendMessage(recipientId, "CHAT_INIT_RESPONSE", messageData);
     }
@@ -463,7 +454,7 @@ public class ServerNetworkManager implements NetworkManager {
     public CompletableFuture<Void> sendChatInitSignature(String recipientId, String chatUuid, byte[] signature) {
         Map<String, Object> messageData = new HashMap<>();
         messageData.put("chat_uuid", chatUuid);
-        messageData.put("digital_signature", Base64.getEncoder().encodeToString(signature));
+        messageData.put("signature", Base64.getEncoder().encodeToString(signature));
         
         return sendMessage(recipientId, "CHAT_INIT_SIGNATURE", messageData);
     }
@@ -472,7 +463,7 @@ public class ServerNetworkManager implements NetworkManager {
     public CompletableFuture<Void> sendChatDelete(String recipientId, String chatUuid) {
         Map<String, Object> messageData = new HashMap<>();
         messageData.put("chat_uuid", chatUuid);
-        messageData.put("delete_reason", "user_initiated");
+        messageData.put("reason", "user_initiated");
         
         return sendMessage(recipientId, "CHAT_DELETE", messageData);
     }
@@ -711,18 +702,24 @@ public class ServerNetworkManager implements NetworkManager {
                 
                 if (response.isSuccess()) {
                     OrgInfoResponse orgData = response.getData();
-                    
-                    OrganizationInfo orgInfo = new OrganizationInfo(orgData.organization.name, orgData.organization.id);
-                    
-                    // Convert supported algorithms
-                    CryptoAlgorithms algorithms = new CryptoAlgorithms();
-                    // Set default algorithms for now
-                    algorithms.setKemAlgorithm("KYBER");
-                    algorithms.setSymmetricAlgorithm("AES-256");
-                    algorithms.setSignatureAlgorithm("FALCON");
-                    
+
+                    // Build organization info
+                    OrganizationInfo orgInfo = new OrganizationInfo(
+                        orgData.organization.name,
+                        orgData.organization.id
+                    );
+
+                    // Parse supported algorithms from server response
+                    CryptoAlgorithms algorithms = parseOrganizationAlgorithms(orgData.organization.supportedAlgorithms);
                     orgInfo.setSupportedAlgorithms(algorithms);
+
+                    // Set server version if provided (placeholder for now)
                     orgInfo.setServerVersion("1.0.0");
+
+                    // Save server policies for future use
+                    if (orgData.organization.serverPolicies != null) {
+                        orgInfo.getPolicies().putAll(orgData.organization.serverPolicies);
+                    }
                     
                     Log.i(TAG, "Organization info retrieved: " + orgData.organization.name);
                     return orgInfo;
@@ -1077,6 +1074,51 @@ public class ServerNetworkManager implements NetworkManager {
             Log.e(TAG, "Error generating content hash", e);
             return "";
         }
+    }
+
+    /**
+     * Parse organization supported algorithms
+     */
+    private CryptoAlgorithms parseOrganizationAlgorithms(Map<String, Object> supportedAlgorithms) {
+        if (supportedAlgorithms == null) {
+            return new CryptoAlgorithms("KYBER", "AES-256", "FALCON");
+        }
+
+        String kemAlgorithm = "KYBER";
+        String symmetricAlgorithm = "AES-256";
+        String signatureAlgorithm = "FALCON";
+
+        // Asymmetric (KEM) algorithms
+        List<Map<String, Object>> asymmetricList = (List<Map<String, Object>>) supportedAlgorithms.get("asymmetric");
+        if (asymmetricList != null && !asymmetricList.isEmpty()) {
+            Map<String, Object> kemAlg = asymmetricList.get(0);
+            if (kemAlg != null && kemAlg.containsKey("name")) {
+                kemAlgorithm = (String) kemAlg.get("name");
+            }
+        }
+
+        // Symmetric algorithms
+        List<Map<String, Object>> symmetricList = (List<Map<String, Object>>) supportedAlgorithms.get("symmetric");
+        if (symmetricList != null && !symmetricList.isEmpty()) {
+            Map<String, Object> symAlg = symmetricList.get(0);
+            if (symAlg != null && symAlg.containsKey("name")) {
+                symmetricAlgorithm = (String) symAlg.get("name");
+            }
+        }
+
+        // Signature algorithms
+        List<Map<String, Object>> signatureList = (List<Map<String, Object>>) supportedAlgorithms.get("signature");
+        if (signatureList != null && !signatureList.isEmpty()) {
+            Map<String, Object> sigAlg = signatureList.get(0);
+            if (sigAlg != null && sigAlg.containsKey("name")) {
+                signatureAlgorithm = (String) sigAlg.get("name");
+            }
+        }
+
+        Log.d(TAG, String.format("Parsed algorithms - KEM: %s, Symmetric: %s, Signature: %s",
+                kemAlgorithm, symmetricAlgorithm, signatureAlgorithm));
+
+        return new CryptoAlgorithms(kemAlgorithm, symmetricAlgorithm, signatureAlgorithm);
     }
     
     // ===========================
