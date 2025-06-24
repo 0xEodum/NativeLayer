@@ -137,7 +137,7 @@ UIBridge.handleUIMethod("setLocalUser") ->
   });
 ```
 
-## 6. Инициализация чата (ОБНОВЛЕНО)
+## 6. Инициализация чата (ServerMode)
 
 **Сценарий: Создание нового чата**
 ```
@@ -161,7 +161,32 @@ UIBridge.handleUIMethod("initializeChat") ->
   });
 ```
 
-## 7. Отправка сообщения (ОБНОВЛЕНО)
+## 7. Инициализация чата (LocalMode)
+
+**Сценарий: Создание нового чата**
+```
+UIBridge.handleUIMethod("initializeChat") ->
+  BackgroundService.initializeChat(recipientId) ->
+    SharedPreferencesManager preferencesManager = SharedPreferencesManager.getInstance() ->
+    CryptoAlgorithms algorithms = preferencesManager.getCryptoAlgorithms() ->
+    ChatKeys chatKeys = CryptoManager.initializeChatKeysFromPreferences(preferencesManager) ->
+    Chat chat = new Chat(UUID.randomUUID().toString(), name) ->
+    chat.setKeys(chatKeys) ->
+    String chatId = DatabaseManager.saveChat(chat) ->
+    StateManager.setActiveChatId(chatId) ->
+    
+    // Асинхронная отправка:
+    NetworkManager.sendChatInitRequest(recipientId, chatUuid, chatKeys.getPublicKeySelf())  // -> CompletableFuture<Void>
+      .thenApply(v -> true)
+  .thenAccept(success -> UIBridge.sendEventToUI("ChatInitialized"))
+  .exceptionally(throwable -> {
+    UIBridge.onErrorOccurred(new AppError("CHAT_INIT_FAILED", throwable.getMessage()));
+    return null;
+  });
+```
+
+
+## 8. Отправка сообщения (ОБНОВЛЕНО)
 
 **Сценарий: Пользователь отправляет сообщение (ChatScreen)**
 ```
@@ -191,7 +216,7 @@ UIBridge.handleUIMethod("sendMessage") ->
   });
 ```
 
-## 8. Получение сообщения (БЕЗ ИЗМЕНЕНИЙ)
+## 9. Получение сообщения
 
 **Сценарий: Приход сообщения от собеседника**
 ```
@@ -204,7 +229,7 @@ NetworkManager.handlePeerMessage(peerId, messageData) ->  // Приватный 
   UIBridge.showNotification(notificationData)
 ```
 
-## 9. Передача файла (ОБНОВЛЕНО)
+## 10. Передача файла
 
 **Сценарий: Отправка файла в чате**
 ```
@@ -247,7 +272,7 @@ UIBridge.handleUIMethod("sendFile") ->
   });
 ```
 
-## 10. Обмен ключами KEM (БЕЗ ИЗМЕНЕНИЙ)
+## 11. Обмен ключами KEM
 
 **Сценарий: Установка защищенного соединения**
 ```
@@ -269,7 +294,7 @@ NetworkManager.handleChatInitResponse() ->  // Приватный обработ
   UIBridge.onEncryptionStatusChanged(ACTIVE)
 ```
 
-## 11. Поиск пользователей (ОБНОВЛЕНО)
+## 12. Поиск пользователей
 
 **Сценарий: Поиск новых собеседников (ChatListScreen)**
 ```
@@ -295,7 +320,7 @@ UIBridge.handleUIMethod("startChatWithUser") ->
   [см. сценарий 6 - Инициализация чата]
 ```
 
-## 12. Выход из приложения (ОБНОВЛЕНО)
+## 13. Выход из приложения
 
 **Сценарий: Logout пользователя**
 ```
@@ -319,7 +344,7 @@ UIBridge.handleUIMethod("logout") ->
   });
 ```
 
-## 13. Смена темы интерфейса (ОБНОВЛЕНО)
+## 14. Смена темы интерфейса
 
 **Сценарий: Переключение темной/светлой темы (SettingsScreen)**
 ```
@@ -337,7 +362,7 @@ UIBridge.handleUIMethod("changeTheme") ->
   });
 ```
 
-## 14. Изменение алгоритмов шифрования (ОБНОВЛЕНО)
+## 15. Изменение алгоритмов шифрования
 
 **Сценарий: Пользователь меняет алгоритмы (EncryptionSettingsScreen - local mode)**
 ```
@@ -357,7 +382,7 @@ UIBridge.handleUIMethod("updateCryptoAlgorithms") ->
   });
 ```
 
-## 15. Восстановление после сбоя (БЕЗ ИЗМЕНЕНИЙ)
+## 16. Восстановление после сбоя
 
 **Сценарий: Восстановление состояния при перезапуске**
 ```
@@ -392,44 +417,28 @@ BackgroundService.initialize() ->
   }
 ```
 
-## 16. Автоматический вход по сохраненной сессии (БЕЗ ИЗМЕНЕНИЙ)
-
-**Сценарий: Определение стартового экрана (SplashScreen) - determineStartScreen()**
-
-[Остается без изменений, так как эта логика выполняется в StateManager.determineStartScreen() и координируется BackgroundService.scheduleConnectionRestoration()]
+## 17. Автоматический вход по сохраненной сессии (БЕЗ ИЗМЕНЕНИЙ)
+```
+BackgroundService.initialize() ->
+  SessionManager.getCurrentSession() ->
+  SessionManager.isSessionValid() ->
+  SessionManager.refreshSession() ->
+  ServerNetworkManager.connect(savedServerConfig) ->
+  StateManager.setAppState(AUTHENTICATED) ->
+  UIBridge.sendEventToUI(NavigateToChats)
+```
 
 ---
 
-## Ключевые изменения в архитектуре
 
-### 1. **Четкое разделение ответственности**
-- **UIBridge**: Только мост между UI и бизнес-логикой
-- **BackgroundService**: Координатор всей бизнес-логики
-- **Остальные компоненты**: Сфокусированы на своих специфических задачах
-
-### 2. **Единая точка координации**
-- Вся сложная бизнес-логика инкапсулирована в BackgroundService
-- Легкость тестирования и отладки
-- Повторное использование логики
-
-### 3. **Асинхронная обработка**
-- Все сетевые операции возвращают `CompletableFuture`
-- Композиция операций через `.thenCompose()`, `.thenAccept()`
-- Обязательная обработка ошибок через `.exceptionally()`
-
-### 4. **Улучшенная обработка ошибок**
-- Унифицированная обработка через `AppError`
-- UI получает конкретные ошибки и может реагировать соответственно
-- Graceful degradation для критических операций
-
-### 5. **Чистая цепочка вызовов**
+### 18. **Чистая цепочка вызовов**
 ```
 Flutter UI -> UIBridge -> BackgroundService -> [Business Components]
      ↑                                              ↓
      ←-------- UI Events ←-------- Results ←-------
 ```
 
-## 13. Смена темы интерфейса (БЕЗ ИЗМЕНЕНИЙ)
+## 19. Смена темы интерфейса (БЕЗ ИЗМЕНЕНИЙ)
 
 **Сценарий: Переключение темной/светлой темы (SettingsScreen)**
 ```
@@ -439,7 +448,7 @@ UIBridge.handleUIMethod("changeTheme") ->
   UIBridge.sendEventToUI(ThemeUpdated)
 ```
 
-## 14. Изменение алгоритмов шифрования (БЕЗ ИЗМЕНЕНИЙ)
+## 20. Изменение алгоритмов шифрования (БЕЗ ИЗМЕНЕНИЙ)
 
 **Сценарий: Пользователь меняет алгоритмы (EncryptionSettingsScreen - local mode)**
 ```
@@ -452,7 +461,7 @@ UIBridge.handleUIMethod("updateCryptoAlgorithms") ->
   UIBridge.sendEventToUI(AlgorithmsUpdated)
 ```
 
-## 15. Восстановление после сбоя (ОБНОВЛЕНО)
+## 21. Восстановление после сбоя (ОБНОВЛЕНО)
 
 **Сценарий: Восстановление состояния при перезапуске**
 ```
@@ -487,11 +496,8 @@ BackgroundService.initialize() ->
   }
 ```
 
-## 16. Автоматический вход по сохраненной сессии (ДЕТАЛЬНЫЙ АНАЛИЗ)
+## 22. Автоматический вход по сохраненной сессии (ДЕТАЛЬНЫЙ АНАЛИЗ)
 
-**Сценарий: Определение стартового экрана (SplashScreen) - determineStartScreen()**
-
-Этот сценарий является самым сложным, так как он определяет весь пользовательский опыт при запуске приложения.
 
 ### Полная логика determineStartScreen():
 
@@ -677,37 +683,6 @@ BackgroundService.initialize() ->
 3. **Обновление токена**: Автоматическое обновление токена через `refreshSession()`
 4. **Очистка невалидных данных**: Автоматическая очистка истекших сессий
 
-### Возможные состояния UI во время восстановления:
-
-```
-1. SplashScreen -> CHAT_LIST (сессия валидна)
-   ├─ Показать индикатор "Восстановление соединения..."
-   ├─ При успехе: скрыть индикатор, показать актуальные данные
-   └─ При ошибке: показать уведомление + переход на AUTH
-
-2. SplashScreen -> AUTHENTICATION (сессия невалидна)
-
-3. SplashScreen -> SERVER_CONNECTION (нет конфигурации сервера)
-
-4. SplashScreen -> MODE_SELECTION (первый запуск)
-```
-
-## Дополнительные методы в StateManager:
-
-```java
-// В StateManager нужно добавить:
-private void scheduleConnectionRestoration() {
-    // Запуск асинхронного восстановления соединения
-}
-
-public boolean shouldShowConnectionProgress() {
-    // Определяет, нужно ли показывать индикатор восстановления соединения
-}
-
-public boolean isRestoringConnection() {
-    // Проверяет, идет ли процесс восстановления
-}
-```
 
 ### 1. **Асинхронная обработка**
 - Все сетевые операции теперь возвращают `CompletableFuture`
