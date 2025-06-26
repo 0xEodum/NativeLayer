@@ -14,6 +14,8 @@ import com.google.gson.JsonSyntaxException;
 
 import com.yumsg.core.data.*;
 import com.yumsg.core.enums.*;
+import com.yumsg.core.network.NetworkManager;
+import com.yumsg.core.network.ServerNetworkManager;
 
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
@@ -22,6 +24,7 @@ import javax.crypto.spec.IvParameterSpec;
 import java.security.KeyStore;
 import java.security.SecureRandom;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
@@ -37,7 +40,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * - Session validation and expiration handling
  * - Automatic session cleanup and security
  * - Mode switching support
- * - Token refresh coordination (stub for NetworkManager integration)
+ * - Token refresh coordination via NetworkManager
  */
 public class SessionManager {
     private static final String TAG = "SessionManager";
@@ -67,6 +70,8 @@ public class SessionManager {
     private final Context context;
     private final SharedPreferences sessionPrefs;
     private final Gson gson;
+    // Network manager reference for token refresh
+    private volatile NetworkManager networkManager;
     
     // State
     private volatile boolean isInitialized = false;
@@ -147,7 +152,20 @@ public class SessionManager {
             lock.writeLock().unlock();
         }
     }
-    
+
+    /**
+     * Set network manager for token refresh operations
+     */
+    public void setNetworkManager(NetworkManager networkManager) {
+        lock.writeLock().lock();
+        try {
+            this.networkManager = networkManager;
+            Log.d(TAG, "NetworkManager set for session refresh operations");
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
     // ===========================
     // SESSION MANAGEMENT
     // ===========================
@@ -309,57 +327,125 @@ public class SessionManager {
     }
     
     /**
-     * Refresh session token (stub - requires NetworkManager)
+     * Refresh session token using NetworkManager if available
      */
     public boolean refreshSession() {
         checkInitialized();
-        
+
         lock.writeLock().lock();
         try {
             if (currentSession == null) {
                 Log.w(TAG, "No session to refresh");
                 return false;
             }
-            
+
             if (currentSession.isRefreshTokenExpired()) {
                 Log.w(TAG, "Refresh token expired - cannot refresh session");
                 destroySession();
                 return false;
             }
-            
+
             Log.d(TAG, "Session refresh requested for: " + currentSession.getUsername());
-            
-            // TODO: Implement actual token refresh when ServerNetworkManager is available
-            // This would typically involve:
-            // 1. Making HTTP request to /auth/refresh endpoint
-            // 2. Sending current refresh token
-            // 3. Receiving new access token and possibly new refresh token
-            // 4. Updating currentSession with new tokens
-            // 5. Saving updated session to storage
-            
-            Log.w(TAG, "Session refresh not implemented - requires ServerNetworkManager integration");
-            
-            // For now, just extend the session if it's still valid
-            if (currentSession.needsRefresh()) {
-                // Simulate token refresh by extending expiration
-                long newExpiresAt = System.currentTimeMillis() + DEFAULT_SESSION_TIMEOUT;
-                currentSession.updateAccessToken(currentSession.getAccessToken(), newExpiresAt);
-                saveSessionToStorage();
-                
-                Log.d(TAG, "Session extended temporarily (mock refresh)");
-                return true;
+
+            if (networkManager instanceof ServerNetworkManager) {
+                ServerNetworkManager serverManager = (ServerNetworkManager) networkManager;
+                try {
+                    CompletableFuture<SessionAuthData> refreshFuture =
+                        serverManager.refreshSessionToken(currentSession.getRefreshToken());
+
+                    SessionAuthData refreshedSession = refreshFuture.get(10, TimeUnit.SECONDS);
+
+                    if (refreshedSession != null) {
+                        currentSession.updateTokens(
+                            refreshedSession.getAccessToken(),
+                            refreshedSession.getRefreshToken(),
+                            refreshedSession.getExpiresAt());
+                        saveSessionToStorage();
+
+                        Log.i(TAG, "Session refreshed successfully");
+                        return true;
+                    } else {
+                        Log.w(TAG, "Session refresh failed - received null response");
+                        return false;
+                    }
+                } catch (Exception e) {
+                    Log.e(TAG, "Session refresh failed", e);
+                    return false;
+                }
+            } else {
+                Log.w(TAG, "No ServerNetworkManager available for session refresh");
+
+                if (currentSession.needsRefresh()) {
+                    long newExpiresAt = System.currentTimeMillis() + DEFAULT_SESSION_TIMEOUT;
+                    currentSession.updateAccessToken(currentSession.getAccessToken(), newExpiresAt);
+                    saveSessionToStorage();
+
+                    Log.d(TAG, "Session extended locally (fallback mode)");
+                    return true;
+                }
+                return false;
             }
-            
-            return false;
-            
-        } catch (Exception e) {
-            Log.e(TAG, "Error during session refresh", e);
-            return false;
         } finally {
             lock.writeLock().unlock();
         }
     }
-    
+
+    /**
+     * Check if session refresh is available
+     */
+    public boolean canRefreshSession() {
+        lock.readLock().lock();
+        try {
+            return currentSession != null &&
+                   !currentSession.isRefreshTokenExpired() &&
+                   networkManager instanceof ServerNetworkManager;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /**
+     * Get current access token for network requests
+     */
+    public String getCurrentAccessToken() {
+        lock.readLock().lock();
+        try {
+            return currentSession != null ? currentSession.getAccessToken() : null;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /**
+     * Check if access token needs refresh
+     */
+    public boolean needsTokenRefresh() {
+        lock.readLock().lock();
+        try {
+            return currentSession != null && currentSession.needsRefresh();
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /**
+     * Handle token expiration notification from network layer
+     */
+    public void onTokenExpired() {
+        Log.w(TAG, "Token expired notification received");
+
+        if (canRefreshSession()) {
+            Log.d(TAG, "Attempting automatic token refresh");
+            if (!refreshSession()) {
+                Log.w(TAG, "Automatic token refresh failed, session will be destroyed");
+                destroySession();
+            }
+        } else {
+            Log.w(TAG, "Cannot refresh token, destroying session");
+            destroySession();
+        }
+    }
+
     // ===========================
     // USER CREDENTIALS (NOT STORED)
     // ===========================
