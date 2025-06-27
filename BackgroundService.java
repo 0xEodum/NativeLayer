@@ -1213,170 +1213,232 @@ public class BackgroundService {
      * Handle chat initialization request
      */
     private void handleChatInitRequest(String fromUserId, Map<String, Object> messageData) {
-        String chatUuid = (String) messageData.get("chat_uuid");
-        String peerPublicKeyB64 = (String) messageData.get("public_key");
-        @SuppressWarnings("unchecked")
-        Map<String, String> algMap = (Map<String, String>) messageData.get("crypto_algorithms");
+        try {
+            String chatUuid = (String) messageData.get("chat_uuid");
+            String peerPublicKeyB64 = (String) messageData.get("public_key");
+            @SuppressWarnings("unchecked")
+            Map<String, String> algMap = (Map<String, String>) messageData.get("crypto_algorithms");
 
-        if (chatUuid == null || peerPublicKeyB64 == null) {
-            Log.w(TAG, "Invalid chat init request data");
-            return;
+            if (chatUuid == null || peerPublicKeyB64 == null) {
+                Log.w(TAG, "Invalid chat init request data");
+                return;
+            }
+
+            CryptoAlgorithms algorithms;
+            if (algMap != null) {
+                algorithms = new CryptoAlgorithms(
+                        algMap.get("asymmetric"),
+                        algMap.get("symmetric"),
+                        algMap.get("signature"));
+            } else {
+                algorithms = preferencesManager.getCryptoAlgorithms();
+            }
+
+            byte[] peerPublicKeyBytes = Base64.getDecoder().decode(peerPublicKeyB64);
+            AsymmetricKeyParameter peerKeyParam = cryptoManager.bytesToKemPublicKey(
+                peerPublicKeyBytes, algorithms.getKemAlgorithm());
+            byte[] peerPublicKey = cryptoManager.getPublicKeyBytes(
+                peerKeyParam, algorithms.getKemAlgorithm());
+
+            Chat chat = findOrCreateChat(chatUuid, fromUserId);
+            if (chat.getKeyEstablishmentStatus() == null || chat.getKeyEstablishmentStatus().isEmpty()) {
+                chat.setKeyEstablishmentStatus("INITIALIZING");
+            }
+
+            ChatKeys chatKeys = cryptoManager.createChatKeys(algorithms.getKemAlgorithm());
+            chatKeys.setPublicKeyPeer(peerPublicKey);
+
+            PeerCryptoInfo peerInfo = chat.getPeerCryptoInfo();
+            if (peerInfo == null) {
+                peerInfo = new PeerCryptoInfo();
+                peerInfo.setPeerId(fromUserId);
+            }
+            peerInfo.setPeerAlgorithms(algorithms);
+            chat.setPeerCryptoInfo(peerInfo);
+
+            SecretWithEncapsulation kemResult = cryptoManager.encapsulateSecret(
+                peerPublicKey, algorithms.getKemAlgorithm());
+            pendingSecrets.put(chatUuid, kemResult.getSecret());
+
+            chat.setKeys(chatKeys);
+            databaseManager.saveChat(chat);
+
+            networkManager.sendChatInitResponse(fromUserId, chatUuid,
+                chatKeys.getPublicKeySelf(), kemResult.getEncapsulation(), null);
+
+            Log.i(TAG, "Chat init request processed, response sent. Chat: " + chatUuid);
+
+        } catch (IllegalArgumentException e) {
+            Log.e(TAG, "Invalid cryptographic parameters in chat init request", e);
+        } catch (Exception e) {
+            Log.e(TAG, "Unexpected error in handleChatInitRequest", e);
         }
-
-        // Determine algorithms
-        CryptoAlgorithms algorithms;
-        if (algMap != null) {
-            algorithms = new CryptoAlgorithms(
-                    algMap.get("asymmetric"),
-                    algMap.get("symmetric"),
-                    algMap.get("signature"));
-        } else {
-            algorithms = preferencesManager.getCryptoAlgorithms();
-        }
-
-        // Decode peer public key using algorithm parser
-        byte[] peerPublicKeyBytes = Base64.getDecoder().decode(peerPublicKeyB64);
-        AsymmetricKeyParameter peerKeyParam = cryptoManager.bytesToKemPublicKey(peerPublicKeyBytes, algorithms.getKemAlgorithm());
-        byte[] peerPublicKey = cryptoManager.getPublicKeyBytes(peerKeyParam, algorithms.getKemAlgorithm());
-
-        // Create or find chat
-        Chat chat = findOrCreateChat(chatUuid, fromUserId);
-
-        // Create chat keys for response
-        ChatKeys chatKeys = cryptoManager.createChatKeys(algorithms.getKemAlgorithm());
-
-        // Update with peer key
-        chatKeys.setPublicKeyPeer(peerPublicKey);
-
-        // Save peer algorithms
-        PeerCryptoInfo peerInfo = chat.getPeerCryptoInfo();
-        if (peerInfo == null) {
-            peerInfo = new PeerCryptoInfo();
-            peerInfo.setPeerId(fromUserId);
-        }
-        peerInfo.setPeerAlgorithms(algorithms);
-        chat.setPeerCryptoInfo(peerInfo);
-
-        // Perform KEM encapsulation
-        SecretWithEncapsulation kemResult = cryptoManager.encapsulateSecret(
-            peerPublicKey, algorithms.getKemAlgorithm());
-        // Store secret until confirmation arrives
-        pendingSecrets.put(chatUuid, kemResult.getSecret());
-        
-        // Save chat with keys
-        chat.setKeys(chatKeys);
-        databaseManager.saveChat(chat);
-        
-        // Send response
-        networkManager.sendChatInitResponse(fromUserId, chatUuid,
-            chatKeys.getPublicKeySelf(), kemResult.getCapsule(), null);
-        
-        Log.d(TAG, "Chat init request processed, response sent");
     }
     
     /**
      * Handle other chat init steps (simplified for brevity)
      */
     private void handleChatInitResponse(String fromUserId, Map<String, Object> messageData) {
-        String chatUuid = (String) messageData.get("chat_uuid");
-        String peerPublicKeyB64 = (String) messageData.get("public_key");
-        String capsuleB64 = (String) messageData.get("kem_capsule");
-        @SuppressWarnings("unchecked")
-        Map<String, String> algMap = (Map<String, String>) messageData.get("crypto_algorithms");
+        try {
+            String chatUuid = (String) messageData.get("chat_uuid");
+            String peerPublicKeyB64 = (String) messageData.get("public_key");
+            String capsuleB64 = (String) messageData.get("kem_capsule");
+            @SuppressWarnings("unchecked")
+            Map<String, String> algMap = (Map<String, String>) messageData.get("crypto_algorithms");
 
-        if (chatUuid == null || peerPublicKeyB64 == null || capsuleB64 == null) {
-            Log.w(TAG, "Invalid chat init response data");
-            return;
+            if (chatUuid == null || peerPublicKeyB64 == null || capsuleB64 == null) {
+                Log.w(TAG, "Invalid chat init response data");
+                return;
+            }
+
+            Chat chat = databaseManager.getChat(chatUuid);
+            if (chat == null) {
+                Log.w(TAG, "Chat not found for init response: " + chatUuid);
+                return;
+            }
+
+            CryptoAlgorithms algorithms;
+            if (algMap != null) {
+                algorithms = new CryptoAlgorithms(
+                        algMap.get("asymmetric"),
+                        algMap.get("symmetric"),
+                        algMap.get("signature"));
+            } else {
+                algorithms = preferencesManager.getCryptoAlgorithms();
+            }
+
+            ChatKeys chatKeys = chat.getKeys();
+            if (chatKeys == null) {
+                Log.w(TAG, "Chat keys missing for chat: " + chatUuid);
+                return;
+            }
+
+            byte[] peerKeyBytes = Base64.getDecoder().decode(peerPublicKeyB64);
+            AsymmetricKeyParameter peerKeyParam = cryptoManager.bytesToKemPublicKey(
+                peerKeyBytes, algorithms.getKemAlgorithm());
+            byte[] peerPublicKey = cryptoManager.getPublicKeyBytes(
+                peerKeyParam, algorithms.getKemAlgorithm());
+            chatKeys.setPublicKeyPeer(peerPublicKey);
+
+            byte[] capsuleBytes = Base64.getDecoder().decode(capsuleB64);
+            byte[] secretB = cryptoManager.extractSecret(
+                capsuleBytes,
+                chatKeys.getPrivateKeySelf(),
+                algorithms.getKemAlgorithm()
+            );
+
+            SecretWithEncapsulation kemResult = cryptoManager.encapsulateSecret(
+                peerPublicKey, algorithms.getKemAlgorithm());
+            byte[] secretA = kemResult.getSecret();
+            byte[] capsuleA = kemResult.getEncapsulation();
+
+            ChatKeys updatedKeys = cryptoManager.completeChatInitialization(
+                chatKeys, secretA, secretB);
+
+            String fingerprint = cryptoManager.generateChatFingerprintFromKeys(updatedKeys);
+
+            ChatKeys cleanedKeys = new ChatKeys(updatedKeys.getAlgorithm());
+            cleanedKeys.setSymmetricKey(updatedKeys.getSymmetricKey());
+            chat.setKeys(cleanedKeys);
+
+            databaseManager.updateChatKeyEstablishment(chat.getId(), fingerprint, "ESTABLISHED");
+            databaseManager.saveChat(chat);
+
+            cryptoManager.secureClearChatKeys(updatedKeys);
+
+            networkManager.sendChatInitConfirm(fromUserId, chatUuid, capsuleA);
+
+            if (uiBridge != null) {
+                Map<String, Object> eventData = new HashMap<>();
+                eventData.put("chatId", chat.getId());
+                eventData.put("fingerprint", fingerprint);
+                eventData.put("status", "ESTABLISHED");
+                uiBridge.sendEventToUI("ChatEstablished", eventData);
+            }
+
+            Log.i(TAG, "Chat initialization completed successfully. Chat: " + chatUuid +
+                   ", Fingerprint: " + fingerprint);
+
+        } catch (IllegalArgumentException e) {
+            Log.e(TAG, "Invalid cryptographic parameters in chat init response", e);
+        } catch (SecurityException e) {
+            Log.e(TAG, "Security error during chat initialization", e);
+        } catch (Exception e) {
+            Log.e(TAG, "Unexpected error in handleChatInitResponse", e);
         }
-
-        Chat chat = findChatByUuid(chatUuid);
-        if (chat == null) {
-            Log.w(TAG, "Chat not found for init response: " + chatUuid);
-            return;
-        }
-
-        CryptoAlgorithms algorithms;
-        if (algMap != null) {
-            algorithms = new CryptoAlgorithms(
-                    algMap.get("asymmetric"),
-                    algMap.get("symmetric"),
-                    algMap.get("signature"));
-        } else {
-            algorithms = preferencesManager.getCryptoAlgorithms();
-        }
-
-        ChatKeys chatKeys = chat.getKeys();
-        if (chatKeys == null) {
-            Log.w(TAG, "Chat keys missing for chat: " + chatUuid);
-            return;
-        }
-
-        byte[] peerKeyBytes = Base64.getDecoder().decode(peerPublicKeyB64);
-        AsymmetricKeyParameter peerKeyParam = cryptoManager.bytesToKemPublicKey(peerKeyBytes, algorithms.getKemAlgorithm());
-        byte[] peerPublicKey = cryptoManager.getPublicKeyBytes(peerKeyParam, algorithms.getKemAlgorithm());
-        chatKeys.setPublicKeyPeer(peerPublicKey);
-
-        byte[] capsuleBytes = Base64.getDecoder().decode(capsuleB64);
-        byte[] secretB = cryptoManager.extractSecret(capsuleBytes, chatKeys.getPrivateKeySelf(), algorithms.getKemAlgorithm());
-
-        SecretWithEncapsulation kemResult = cryptoManager.encapsulateSecret(peerPublicKey, algorithms.getKemAlgorithm());
-        byte[] secretA = kemResult.getSecret();
-        byte[] capsuleA = kemResult.getEncapsulation();
-
-        cryptoManager.completeChatInitialization(chatKeys, secretA, secretB);
-
-        chat.setKeys(chatKeys);
-        databaseManager.saveChat(chat);
-
-        networkManager.sendChatInitConfirm(fromUserId, chatUuid, capsuleA);
-
-        Log.d(TAG, "Chat init response processed and confirm sent");
     }
     
     private void handleChatInitConfirm(String fromUserId, Map<String, Object> messageData) {
-        String chatUuid = (String) messageData.get("chat_uuid");
-        String capsuleB64 = (String) messageData.get("kem_capsule");
+        try {
+            String chatUuid = (String) messageData.get("chat_uuid");
+            String capsuleB64 = (String) messageData.get("kem_capsule");
 
-        if (chatUuid == null || capsuleB64 == null) {
-            Log.w(TAG, "Invalid chat init confirm data");
-            return;
+            if (chatUuid == null || capsuleB64 == null) {
+                Log.w(TAG, "Invalid chat init confirm data");
+                return;
+            }
+
+            Chat chat = databaseManager.getChat(chatUuid);
+            if (chat == null) {
+                Log.w(TAG, "Chat not found for init confirm: " + chatUuid);
+                return;
+            }
+
+            ChatKeys chatKeys = chat.getKeys();
+            if (chatKeys == null) {
+                Log.w(TAG, "Chat keys missing for chat: " + chatUuid);
+                return;
+            }
+
+            CryptoAlgorithms algorithms = preferencesManager.getCryptoAlgorithms();
+
+            byte[] capsuleBytes = Base64.getDecoder().decode(capsuleB64);
+            byte[] secretA = cryptoManager.extractSecret(
+                capsuleBytes,
+                chatKeys.getPrivateKeySelf(),
+                algorithms.getKemAlgorithm()
+            );
+
+            byte[] secretB = pendingSecrets.remove(chatUuid);
+            if (secretB == null) {
+                Log.w(TAG, "No pending secret for chat: " + chatUuid);
+                return;
+            }
+
+            ChatKeys updatedKeys = cryptoManager.completeChatInitialization(
+                chatKeys, secretA, secretB);
+
+            String fingerprint = cryptoManager.generateChatFingerprintFromKeys(updatedKeys);
+
+            ChatKeys cleanedKeys = new ChatKeys(updatedKeys.getAlgorithm());
+            cleanedKeys.setSymmetricKey(updatedKeys.getSymmetricKey());
+            chat.setKeys(cleanedKeys);
+
+            databaseManager.updateChatKeyEstablishment(chat.getId(), fingerprint, "ESTABLISHED");
+            databaseManager.saveChat(chat);
+
+            cryptoManager.secureClearChatKeys(updatedKeys);
+
+            if (uiBridge != null) {
+                Map<String, Object> eventData = new HashMap<>();
+                eventData.put("chatId", chat.getId());
+                eventData.put("fingerprint", fingerprint);
+                eventData.put("status", "ESTABLISHED");
+                uiBridge.sendEventToUI("ChatEstablished", eventData);
+            }
+
+            networkManager.sendChatInitSignature(fromUserId, chatUuid, new byte[0]);
+
+            Log.i(TAG, "Chat initialization confirmed successfully. Chat: " + chatUuid +
+                   ", Fingerprint: " + fingerprint);
+
+        } catch (IllegalArgumentException e) {
+            Log.e(TAG, "Invalid cryptographic parameters in chat init confirm", e);
+        } catch (SecurityException e) {
+            Log.e(TAG, "Security error during chat initialization confirm", e);
+        } catch (Exception e) {
+            Log.e(TAG, "Unexpected error in handleChatInitConfirm", e);
         }
-
-        Chat chat = findChatByUuid(chatUuid);
-        if (chat == null) {
-            Log.w(TAG, "Chat not found for init confirm: " + chatUuid);
-            return;
-        }
-
-        ChatKeys chatKeys = chat.getKeys();
-        if (chatKeys == null) {
-            Log.w(TAG, "Chat keys missing for chat: " + chatUuid);
-            return;
-        }
-
-        CryptoAlgorithms algorithms = preferencesManager.getCryptoAlgorithms();
-        PeerCryptoInfo peerInfo = chat.getPeerCryptoInfo();
-        if (peerInfo != null && peerInfo.getPeerAlgorithms() != null) {
-            algorithms = peerInfo.getPeerAlgorithms();
-        }
-
-        byte[] capsuleBytes = Base64.getDecoder().decode(capsuleB64);
-        byte[] secretA = cryptoManager.extractSecret(capsuleBytes, chatKeys.getPrivateKeySelf(), algorithms.getKemAlgorithm());
-
-        byte[] secretB = pendingSecrets.remove(chatUuid);
-        if (secretB == null) {
-            Log.w(TAG, "No pending secret for chat: " + chatUuid);
-            return;
-        }
-
-        cryptoManager.completeChatInitialization(chatKeys, secretA, secretB);
-
-        chat.setKeys(chatKeys);
-        databaseManager.saveChat(chat);
-
-        networkManager.sendChatInitSignature(fromUserId, chatUuid, new byte[0]);
-
-        Log.d(TAG, "Chat init confirm processed and signature sent");
     }
     
     private void handleChatInitSignature(String fromUserId, Map<String, Object> messageData) {
@@ -1699,12 +1761,21 @@ public class BackgroundService {
      * Find or create chat
      */
     private Chat findOrCreateChat(String chatUuid, String peerUserId) {
-        Chat chat = findChatByUuid(chatUuid);
+        // Use efficient DB lookup
+        Chat chat = databaseManager.getChat(chatUuid);
+
         if (chat == null) {
             chat = new Chat(chatUuid, "Chat with " + peerUserId);
             chat.setLastActivity(System.currentTimeMillis());
+            chat.setKeyEstablishmentStatus("INITIALIZING");
             databaseManager.saveChat(chat);
+            Log.d(TAG, "Created new chat: " + chatUuid + " with status INITIALIZING");
+        } else {
+            chat.setLastActivity(System.currentTimeMillis());
+            Log.d(TAG, "Found existing chat: " + chatUuid +
+                   " with status: " + chat.getKeyEstablishmentStatus());
         }
+
         return chat;
     }
     

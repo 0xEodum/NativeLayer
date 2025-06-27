@@ -81,6 +81,9 @@ public class DatabaseManager extends SQLiteOpenHelper {
     private static final String COLUMN_CHAT_PEER_SIGNATURE_ALGORITHM = "peer_signature_algorithm";
     private static final String COLUMN_CHAT_PEER_ALGORITHMS = "peer_algorithms";
     private static final String COLUMN_CHAT_PEER_CRYPTO_VERIFIED = "peer_crypto_verified";
+    private static final String COLUMN_CHAT_FINGERPRINT = "chat_fingerprint";
+    private static final String COLUMN_CHAT_KEY_ESTABLISHMENT_STATUS = "key_establishment_status";
+    private static final String COLUMN_CHAT_KEY_ESTABLISHMENT_COMPLETED_AT = "key_establishment_completed_at";
     
     // Contacts table columns
     private static final String COLUMN_CONTACT_NAME = "name";
@@ -508,8 +511,18 @@ public class DatabaseManager extends SQLiteOpenHelper {
             values.put(COLUMN_ID, chat.getId());
             values.put(COLUMN_CHAT_NAME, chat.getName());
             values.put(COLUMN_CHAT_LAST_ACTIVITY, chat.getLastActivity());
-            values.put(COLUMN_CREATED_AT, System.currentTimeMillis());
+            values.put(COLUMN_CREATED_AT, chat.getCreatedAt() > 0 ? chat.getCreatedAt() : System.currentTimeMillis());
             values.put(COLUMN_UPDATED_AT, System.currentTimeMillis());
+
+            if (chat.getFingerprint() != null) {
+                values.put(COLUMN_CHAT_FINGERPRINT, chat.getFingerprint());
+            }
+            if (chat.getKeyEstablishmentStatus() != null) {
+                values.put(COLUMN_CHAT_KEY_ESTABLISHMENT_STATUS, chat.getKeyEstablishmentStatus());
+            }
+            if (chat.getKeyEstablishmentCompletedAt() > 0) {
+                values.put(COLUMN_CHAT_KEY_ESTABLISHMENT_COMPLETED_AT, chat.getKeyEstablishmentCompletedAt());
+            }
             
             // Serialize ChatKeys if present
             if (chat.getKeys() != null) {
@@ -1315,6 +1328,166 @@ public class DatabaseManager extends SQLiteOpenHelper {
             lock.writeLock().unlock();
         }
     }
+
+    /**
+     * Update chat key establishment information
+     */
+    public boolean updateChatKeyEstablishment(String chatId, String fingerprint, String status) {
+        if (chatId == null || status == null) {
+            Log.w(TAG, "Cannot update chat key establishment with null parameters");
+            return false;
+        }
+
+        lock.writeLock().lock();
+        try {
+            ContentValues values = new ContentValues();
+            values.put(COLUMN_CHAT_FINGERPRINT, fingerprint);
+            values.put(COLUMN_CHAT_KEY_ESTABLISHMENT_STATUS, status);
+            values.put(COLUMN_CHAT_KEY_ESTABLISHMENT_COMPLETED_AT, System.currentTimeMillis());
+            values.put(COLUMN_UPDATED_AT, System.currentTimeMillis());
+
+            String whereClause = COLUMN_ID + " = ?";
+            String[] whereArgs = {chatId};
+
+            int updatedRows = database.update(TABLE_CHATS, values, whereClause, whereArgs);
+
+            if (updatedRows > 0) {
+                Log.d(TAG, "Updated chat key establishment status: " + chatId + " -> " + status);
+                return true;
+            } else {
+                Log.w(TAG, "Failed to update chat key establishment status for: " + chatId);
+                return false;
+            }
+
+        } catch (SQLiteException e) {
+            Log.e(TAG, "Error updating chat key establishment", e);
+            return false;
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Get chats by key establishment status
+     */
+    public List<Chat> getChatsByKeyEstablishmentStatus(String status) {
+        List<Chat> chats = new ArrayList<>();
+
+        if (status == null) {
+            Log.w(TAG, "Cannot search chats with null status");
+            return chats;
+        }
+
+        lock.readLock().lock();
+        try {
+            String selection = COLUMN_CHAT_KEY_ESTABLISHMENT_STATUS + " = ?";
+            String[] selectionArgs = {status};
+            String orderBy = COLUMN_CHAT_LAST_ACTIVITY + " DESC";
+
+            Cursor cursor = database.query(
+                TABLE_CHATS,
+                null,
+                selection,
+                selectionArgs,
+                null,
+                null,
+                orderBy
+            );
+
+            if (cursor != null) {
+                while (cursor.moveToNext()) {
+                    Chat chat = chatFromCursor(cursor);
+                    if (chat != null) {
+                        chats.add(chat);
+                    }
+                }
+                cursor.close();
+            }
+
+            Log.d(TAG, "Retrieved " + chats.size() + " chats with status: " + status);
+
+        } catch (SQLiteException e) {
+            Log.e(TAG, "Error retrieving chats by establishment status", e);
+        } finally {
+            lock.readLock().unlock();
+        }
+
+        return chats;
+    }
+
+    /**
+     * Get chat fingerprint
+     */
+    public String getChatFingerprint(String chatId) {
+        if (chatId == null) {
+            return null;
+        }
+
+        lock.readLock().lock();
+        try {
+            String[] columns = {COLUMN_CHAT_FINGERPRINT};
+            String selection = COLUMN_ID + " = ?";
+            String[] selectionArgs = {chatId};
+
+            Cursor cursor = database.query(
+                TABLE_CHATS,
+                columns,
+                selection,
+                selectionArgs,
+                null,
+                null,
+                null
+            );
+
+            if (cursor != null && cursor.moveToFirst()) {
+                int fingerprintIndex = cursor.getColumnIndex(COLUMN_CHAT_FINGERPRINT);
+                String fingerprint = cursor.getString(fingerprintIndex);
+                cursor.close();
+                return fingerprint;
+            }
+
+            if (cursor != null) {
+                cursor.close();
+            }
+
+            return null;
+
+        } catch (SQLiteException e) {
+            Log.e(TAG, "Error retrieving chat fingerprint", e);
+            return null;
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /**
+     * Cleanup stale key initializations
+     */
+    public void cleanupStaleInitializations(long maxAgeMs) {
+        lock.writeLock().lock();
+        try {
+            long cutoffTime = System.currentTimeMillis() - maxAgeMs;
+
+            ContentValues values = new ContentValues();
+            values.put(COLUMN_CHAT_KEY_ESTABLISHMENT_STATUS, "FAILED");
+            values.put(COLUMN_UPDATED_AT, System.currentTimeMillis());
+
+            String whereClause = COLUMN_CHAT_KEY_ESTABLISHMENT_STATUS + " = ? AND " +
+                               COLUMN_CREATED_AT + " < ?";
+            String[] whereArgs = {"INITIALIZING", String.valueOf(cutoffTime)};
+
+            int updatedRows = database.update(TABLE_CHATS, values, whereClause, whereArgs);
+
+            if (updatedRows > 0) {
+                Log.i(TAG, "Cleaned up " + updatedRows + " stale chat initializations");
+            }
+
+        } catch (SQLiteException e) {
+            Log.e(TAG, "Error during stale initialization cleanup", e);
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
     
     /**
      * Save user profile
@@ -1713,19 +1886,44 @@ public class DatabaseManager extends SQLiteOpenHelper {
      */
     private Chat chatFromCursor(Cursor cursor) {
         try {
+            int idIndex = cursor.getColumnIndex(COLUMN_ID);
+            int nameIndex = cursor.getColumnIndex(COLUMN_CHAT_NAME);
+            int keysIndex = cursor.getColumnIndex(COLUMN_CHAT_KEYS);
+            int lastActivityIndex = cursor.getColumnIndex(COLUMN_CHAT_LAST_ACTIVITY);
+            int createdAtIndex = cursor.getColumnIndex(COLUMN_CREATED_AT);
+            int updatedAtIndex = cursor.getColumnIndex(COLUMN_UPDATED_AT);
+            int fingerprintIndex = cursor.getColumnIndex(COLUMN_CHAT_FINGERPRINT);
+            int statusIndex = cursor.getColumnIndex(COLUMN_CHAT_KEY_ESTABLISHMENT_STATUS);
+            int completedAtIndex = cursor.getColumnIndex(COLUMN_CHAT_KEY_ESTABLISHMENT_COMPLETED_AT);
+
             Chat chat = new Chat();
-            chat.setId(cursor.getString(cursor.getColumnIndexOrThrow(COLUMN_ID)));
-            chat.setName(cursor.getString(cursor.getColumnIndexOrThrow(COLUMN_CHAT_NAME)));
-            chat.setLastActivity(cursor.getLong(cursor.getColumnIndexOrThrow(COLUMN_CHAT_LAST_ACTIVITY)));
-            
-            // Deserialize ChatKeys if present
-            String keysJson = cursor.getString(cursor.getColumnIndexOrThrow(COLUMN_CHAT_KEYS));
+            chat.setId(cursor.getString(idIndex));
+            chat.setName(cursor.getString(nameIndex));
+            chat.setLastActivity(cursor.getLong(lastActivityIndex));
+            if (createdAtIndex >= 0) {
+                chat.setCreatedAt(cursor.getLong(createdAtIndex));
+            }
+            if (updatedAtIndex >= 0) {
+                chat.setUpdatedAt(cursor.getLong(updatedAtIndex));
+            }
+
+            if (fingerprintIndex >= 0) {
+                chat.setFingerprint(cursor.getString(fingerprintIndex));
+            }
+            if (statusIndex >= 0) {
+                chat.setKeyEstablishmentStatus(cursor.getString(statusIndex));
+            }
+            if (completedAtIndex >= 0) {
+                chat.setKeyEstablishmentCompletedAt(cursor.getLong(completedAtIndex));
+            }
+
+            String keysJson = cursor.getString(keysIndex);
             if (keysJson != null && !keysJson.trim().isEmpty()) {
                 try {
                     ChatKeys keys = gson.fromJson(keysJson, ChatKeys.class);
                     chat.setKeys(keys);
                 } catch (JsonSyntaxException e) {
-                    Log.w(TAG, "Failed to deserialize chat keys for chat: " + chat.getId(), e);
+                    Log.e(TAG, "Error parsing chat keys JSON", e);
                 }
             }
             
@@ -1920,7 +2118,7 @@ public class DatabaseManager extends SQLiteOpenHelper {
         COLUMN_UPDATED_AT + " INTEGER NOT NULL" +
         ");";
     
-    private static final String CREATE_CHATS_TABLE = 
+    private static final String CREATE_CHATS_TABLE =
         "CREATE TABLE " + TABLE_CHATS + " (" +
         COLUMN_ID + " TEXT PRIMARY KEY, " +
         COLUMN_CHAT_NAME + " TEXT, " +
@@ -1932,6 +2130,9 @@ public class DatabaseManager extends SQLiteOpenHelper {
         COLUMN_CHAT_PEER_SIGNATURE_ALGORITHM + " TEXT, " +
         COLUMN_CHAT_PEER_ALGORITHMS + " TEXT, " +
         COLUMN_CHAT_PEER_CRYPTO_VERIFIED + " INTEGER DEFAULT 0, " +
+        COLUMN_CHAT_FINGERPRINT + " TEXT, " +
+        COLUMN_CHAT_KEY_ESTABLISHMENT_STATUS + " TEXT DEFAULT 'INITIALIZING', " +
+        COLUMN_CHAT_KEY_ESTABLISHMENT_COMPLETED_AT + " INTEGER, " +
         COLUMN_CREATED_AT + " INTEGER NOT NULL, " +
         COLUMN_UPDATED_AT + " INTEGER NOT NULL" +
         ");";
