@@ -1,3 +1,5 @@
+package com.yumsg.core.data;
+
 public class Chat {
     private String id;
     private String name;
